@@ -174,31 +174,46 @@ function deleteTaskById(id) {
 
 // ---------- Helpers: file upload to transfer.sh ----------
 
-async function uploadToTransferSh(filePath) {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`File not found: ${filePath}`);
-  }
-  const stat = fs.statSync(filePath);
-  const stream = fs.createReadStream(filePath);
-  const filename = encodeURIComponent(path.basename(filePath));
-  const url = `https://transfer.sh/${filename}`;
+const MIME_BY_EXT = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+};
 
-  const resp = await axios.put(url, stream, {
+function mimeFor(filename) {
+  return MIME_BY_EXT[path.extname(filename).toLowerCase()] || 'application/octet-stream';
+}
+
+async function putToTransferSh(buffer, filename) {
+  const safeName = encodeURIComponent(filename || `upload-${Date.now()}.bin`);
+  const url = `https://transfer.sh/${safeName}`;
+  const resp = await axios.put(url, buffer, {
     headers: {
       'Content-Type': 'application/octet-stream',
-      'Content-Length': stat.size,
+      'Content-Length': buffer.length ?? buffer.byteLength,
     },
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     timeout: 5 * 60_000,
     validateStatus: (s) => s >= 200 && s < 300,
   });
-
   const publicUrl = String(resp.data || '').trim();
   if (!/^https?:\/\//i.test(publicUrl)) {
     throw new Error('transfer.sh did not return a valid URL');
   }
   return publicUrl;
+}
+
+async function uploadToTransferSh(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+  const buf = fs.readFileSync(filePath);
+  return putToTransferSh(buf, path.basename(filePath));
 }
 
 // ---------- Polling ----------
@@ -324,6 +339,31 @@ function registerIpc() {
   // -- Upload to transfer.sh --
   ipcMain.handle('upload-file', async (_e, filePath) => {
     return uploadToTransferSh(filePath);
+  });
+
+  // -- Upload an in-memory buffer (e.g. a cropped image from the renderer) --
+  ipcMain.handle('upload-buffer', async (_e, payload) => {
+    const { filename, dataBase64 } = payload || {};
+    if (typeof dataBase64 !== 'string' || !dataBase64) {
+      throw new Error('upload-buffer: dataBase64 is required');
+    }
+    const buf = Buffer.from(dataBase64, 'base64');
+    if (!buf.length) throw new Error('upload-buffer: empty buffer');
+    return putToTransferSh(buf, filename);
+  });
+
+  // -- Read a local file and return base64 (for previewing in the renderer) --
+  ipcMain.handle('read-file-base64', async (_e, filePath) => {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    const buf = fs.readFileSync(filePath);
+    return {
+      name: path.basename(filePath),
+      size: buf.length,
+      mime: mimeFor(filePath),
+      dataBase64: buf.toString('base64'),
+    };
   });
 
   // -- Submit Motion Control task --

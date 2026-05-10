@@ -1,5 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import StatusBadge from '../components/StatusBadge.jsx';
+import CropperModal from '../components/CropperModal.jsx';
+import {
+  base64ToBlob,
+  blobToBase64,
+  cropFilename,
+} from '../lib/imageCrop.js';
+
+const RATIOS = [
+  { value: '1:1', label: '1:1' },
+  { value: '9:16', label: '9:16' },
+  { value: '16:9', label: '16:9' },
+  { value: '4:3', label: '4:3' },
+  { value: 'free', label: 'Free' },
+];
 
 const PHASES = {
   IDLE: 'IDLE',
@@ -23,11 +37,18 @@ const PHASE_LABEL = {
 
 export default function Generator({ keys, activeKey, onGoToSettings, onGoToHistory }) {
   const [imageFile, setImageFile] = useState(null);
+  const [imageBlobUrl, setImageBlobUrl] = useState(null);
+  const [imageLoadError, setImageLoadError] = useState(null);
   const [videoFile, setVideoFile] = useState(null);
   const [prompt, setPrompt] = useState('');
   const [quality, setQuality] = useState('pro'); // 'pro' | 'std'
   const [orientation, setOrientation] = useState('video'); // 'video' | 'image'
   const [cfgScale, setCfgScale] = useState(0.5);
+
+  // Aspect ratio cropper state.
+  const [ratio, setRatio] = useState('free'); // '1:1' | '9:16' | '16:9' | '4:3' | 'free'
+  const [cropResult, setCropResult] = useState(null); // { ratio, dataBase64, mime, blobUrl, name }
+  const [cropperRatio, setCropperRatio] = useState(null); // active modal aspect, null when closed
 
   const [phase, setPhase] = useState(PHASES.IDLE);
   const [error, setError] = useState(null);
@@ -74,13 +95,86 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     return () => clearInterval(interval);
   }, [phase, activeTask?.lastPolledAt]);
 
+  // Load the picked image into a blob URL so the cropper can preview it.
+  useEffect(() => {
+    if (!imageFile?.path) {
+      setImageBlobUrl(null);
+      return undefined;
+    }
+    let revoked = false;
+    let urlToRevoke = null;
+    (async () => {
+      try {
+        setImageLoadError(null);
+        const data = await window.api.readFile(imageFile.path);
+        if (revoked) return;
+        const blob = base64ToBlob(data.dataBase64, data.mime);
+        const url = URL.createObjectURL(blob);
+        urlToRevoke = url;
+        setImageBlobUrl(url);
+      } catch (err) {
+        if (!revoked) setImageLoadError(err?.message || String(err));
+      }
+    })();
+    return () => {
+      revoked = true;
+      if (urlToRevoke) URL.revokeObjectURL(urlToRevoke);
+    };
+  }, [imageFile?.path]);
+
+  // Revoke the cropped blob URL when it's replaced.
+  useEffect(() => {
+    return () => {
+      if (cropResult?.blobUrl) URL.revokeObjectURL(cropResult.blobUrl);
+    };
+  }, [cropResult?.blobUrl]);
+
   const handlePickImage = async () => {
     const f = await window.api.selectFile('image');
-    if (f) setImageFile(f);
+    if (f) {
+      setImageFile(f);
+      // Reset crop state — the previous crop no longer applies.
+      setRatio('free');
+      setCropResult(null);
+      setCropperRatio(null);
+    }
+  };
+  const handleClearImage = () => {
+    setImageFile(null);
+    setRatio('free');
+    setCropResult(null);
+    setCropperRatio(null);
   };
   const handlePickVideo = async () => {
     const f = await window.api.selectFile('video');
     if (f) setVideoFile(f);
+  };
+
+  const handleRatioClick = (value) => {
+    if (value === 'free') {
+      setRatio('free');
+      setCropResult(null);
+      setCropperRatio(null);
+      return;
+    }
+    setCropperRatio(value);
+  };
+
+  const handleCropConfirm = async (blob) => {
+    const dataBase64 = await blobToBase64(blob);
+    const blobUrl = URL.createObjectURL(blob);
+    setCropResult((prev) => {
+      if (prev?.blobUrl) URL.revokeObjectURL(prev.blobUrl);
+      return {
+        ratio: cropperRatio,
+        dataBase64,
+        mime: blob.type || 'image/jpeg',
+        blobUrl,
+        name: cropFilename(imageFile?.name || 'image.jpg', cropperRatio),
+      };
+    });
+    setRatio(cropperRatio);
+    setCropperRatio(null);
   };
 
   const handleSubmit = async (e) => {
@@ -90,7 +184,14 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
 
     try {
       setPhase(PHASES.UPLOADING_IMAGE);
-      const imageUrl = await window.api.uploadFile(imageFile.path);
+      // If the user produced a cropped image, upload that buffer instead of
+      // the original file. Otherwise (Free / no crop yet) upload the file as-is.
+      const imageUrl = cropResult
+        ? await window.api.uploadBuffer({
+            filename: cropResult.name,
+            dataBase64: cropResult.dataBase64,
+          })
+        : await window.api.uploadFile(imageFile.path);
 
       setPhase(PHASES.UPLOADING_VIDEO);
       const videoUrl = await window.api.uploadFile(videoFile.path);
@@ -121,6 +222,9 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     setActiveTask(null);
     setPhase(PHASES.IDLE);
     setError(null);
+    setRatio('free');
+    setCropResult(null);
+    setCropperRatio(null);
   };
 
   const handleDownload = async () => {
@@ -160,13 +264,25 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <form className="card lg:col-span-2 space-y-5" onSubmit={handleSubmit}>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <FilePicker
-            label="Character image (JPG/PNG/WEBP, ≥300px, ≤10MB)"
-            file={imageFile}
-            onPick={handlePickImage}
-            onClear={() => setImageFile(null)}
-            accent="image"
-          />
+          <div className="space-y-3">
+            <FilePicker
+              label="Character image (JPG/PNG/WEBP, ≥300px, ≤10MB)"
+              file={imageFile}
+              onPick={handlePickImage}
+              onClear={handleClearImage}
+              accent="image"
+            />
+            {imageFile && (
+              <RatioPicker
+                ratio={ratio}
+                cropResult={cropResult}
+                imageBlobUrl={imageBlobUrl}
+                imageLoadError={imageLoadError}
+                onPick={handleRatioClick}
+                onRecrop={() => cropResult && setCropperRatio(cropResult.ratio)}
+              />
+            )}
+          </div>
           <FilePicker
             label="Reference motion video (MP4/MOV, 3–30s, ≤100MB)"
             file={videoFile}
@@ -299,6 +415,89 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
           </div>
         )}
       </aside>
+
+      {cropperRatio && imageBlobUrl && (
+        <CropperModal
+          imageUrl={imageBlobUrl}
+          ratio={cropperRatio}
+          onConfirm={handleCropConfirm}
+          onCancel={() => setCropperRatio(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function RatioPicker({
+  ratio,
+  cropResult,
+  imageBlobUrl,
+  imageLoadError,
+  onPick,
+  onRecrop,
+}) {
+  return (
+    <div className="border border-white/10 rounded-md bg-black/30 p-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="label !mb-0">Aspect ratio</span>
+        {cropResult ? (
+          <button
+            type="button"
+            className="text-xs text-accent hover:underline"
+            onClick={onRecrop}
+          >
+            Re-crop
+          </button>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {RATIOS.map((r) => {
+          const active = ratio === r.value;
+          return (
+            <button
+              key={r.value}
+              type="button"
+              onClick={() => onPick(r.value)}
+              className={`px-3 py-1 text-xs rounded border transition-colors ${
+                active
+                  ? 'bg-accent border-accent text-white'
+                  : 'bg-black/40 border-white/10 text-gray-300 hover:text-white hover:border-white/30'
+              }`}
+            >
+              {r.label}
+            </button>
+          );
+        })}
+      </div>
+      {imageLoadError && (
+        <div className="text-xs text-red-300">
+          Could not read image: {imageLoadError}
+        </div>
+      )}
+      {cropResult ? (
+        <div className="flex items-center gap-3 pt-1">
+          <img
+            src={cropResult.blobUrl}
+            alt="Cropped preview"
+            className="w-16 h-16 object-cover rounded border border-white/10 bg-black"
+          />
+          <div className="text-xs text-gray-300">
+            <div className="text-gray-200">Cropped to {cropResult.ratio}</div>
+            <div className="text-gray-500">{cropResult.name}</div>
+          </div>
+        </div>
+      ) : ratio === 'free' ? (
+        <p className="text-xs text-gray-500">
+          Free — the original image will be uploaded without cropping.
+        </p>
+      ) : (
+        <p className="text-xs text-gray-500">
+          Pick a ratio above to open the cropper.
+        </p>
+      )}
+      {imageBlobUrl == null && !imageLoadError && (
+        <p className="text-xs text-gray-500">Reading image…</p>
+      )}
     </div>
   );
 }
