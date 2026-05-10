@@ -442,7 +442,57 @@ function registerIpc() {
   });
 
   // -- Download result video to user-chosen folder --
-  ipcMain.handle('download-video', async (_e, { url, defaultName }) => {
+  // Accepts { taskId, defaultName } (preferred) and falls back to a raw
+  // { url } for callers that already have one in hand. The handler is
+  // resilient to short-lived signed URLs and to APIs that gate downloads
+  // on the same x-magnific-api-key header used elsewhere:
+  //
+  //   1. If a taskId is given, poll Magnific once to refresh `resultUrl`.
+  //   2. Try the URL with the active API key + a browser-style UA.
+  //   3. On 401/403 fall back to a plain GET (signed URLs sometimes
+  //      reject extra auth headers).
+  //   4. On 401/403 again, poll once more (URL may have been rotated)
+  //      and retry with the freshest URL.
+  ipcMain.handle('download-video', async (_e, payload) => {
+    const { taskId, defaultName } = payload || {};
+    let { url } = payload || {};
+
+    async function refreshUrl() {
+      if (!taskId) return url;
+      try {
+        const data = await callMagnific({
+          method: 'get',
+          url: ENDPOINT_POLL(taskId),
+        });
+        const inner = data?.data || data || {};
+        const generated = Array.isArray(inner.generated) ? inner.generated : [];
+        const fresh = generated.find(Boolean) || null;
+        if (fresh) {
+          url = fresh;
+          upsertTask({
+            id: taskId,
+            status: inner.status || 'COMPLETED',
+            resultUrl: fresh,
+            lastPolledAt: new Date().toISOString(),
+          });
+        }
+      } catch (_err) {
+        // Best-effort refresh: keep the URL we already have.
+      }
+      return url;
+    }
+
+    if (taskId) {
+      // Use the freshest URL we have on disk first; refresh if missing.
+      const t = getTasks().find((x) => x.id === taskId);
+      if (t?.resultUrl) url = t.resultUrl;
+      if (!url) await refreshUrl();
+    }
+
+    if (!url) {
+      throw new Error('No result URL available for this task yet.');
+    }
+
     const safeName = defaultName || `magnific-${Date.now()}.mp4`;
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Save generated video',
@@ -451,13 +501,55 @@ function registerIpc() {
     });
     if (result.canceled || !result.filePath) return null;
 
-    const resp = await axios.get(url, {
-      responseType: 'stream',
-      timeout: 5 * 60_000,
-      validateStatus: (s) => s >= 200 && s < 300,
-    });
-    await pipeline(resp.data, fs.createWriteStream(result.filePath));
-    return result.filePath;
+    const BROWSER_UA =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+    function activeApiKey() {
+      const keys = getKeys();
+      const idx = getActiveKeyIndex(keys);
+      return idx >= 0 ? keys[idx].value : null;
+    }
+
+    async function attemptDownload(targetUrl, withApiKey) {
+      const headers = { 'User-Agent': BROWSER_UA, Accept: 'video/mp4,*/*' };
+      const key = withApiKey ? activeApiKey() : null;
+      if (key) headers['x-magnific-api-key'] = key;
+      const resp = await axios.get(targetUrl, {
+        headers,
+        responseType: 'stream',
+        timeout: 5 * 60_000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 300,
+      });
+      await pipeline(resp.data, fs.createWriteStream(result.filePath));
+      return result.filePath;
+    }
+
+    function isAuthError(err) {
+      const s = err?.response?.status;
+      return s === 401 || s === 403;
+    }
+
+    try {
+      return await attemptDownload(url, true);
+    } catch (err1) {
+      if (!isAuthError(err1)) throw err1;
+      try {
+        return await attemptDownload(url, false);
+      } catch (err2) {
+        if (!isAuthError(err2) || !taskId) throw err2;
+        // Last resort: refresh URL once more and retry both header modes.
+        const refreshed = await refreshUrl();
+        if (!refreshed || refreshed === url) throw err2;
+        try {
+          return await attemptDownload(refreshed, true);
+        } catch (err3) {
+          if (!isAuthError(err3)) throw err3;
+          return await attemptDownload(refreshed, false);
+        }
+      }
+    }
   });
 
   // -- Task management --
