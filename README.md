@@ -72,8 +72,11 @@ Electron main process — your API key never touches the renderer.
 ## Quick start (one-click launchers)
 
 After cloning the repo, **double-click** the launcher for your operating
-system — it installs dependencies on first run and starts the app. You only
-need [Node.js 20 or newer](https://nodejs.org/) installed beforehand.
+system — it installs dependencies on first run and starts the app. On
+subsequent runs it also re-syncs dependencies (a fast no-op when nothing
+has changed), so after a `git pull` that adds new packages everything
+just works. You only need [Node.js 20 or newer](https://nodejs.org/)
+installed beforehand.
 
 | Operating system | Double-click this file       |
 | ---------------- | ---------------------------- |

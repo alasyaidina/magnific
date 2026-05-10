@@ -27,17 +27,21 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 if [ ! -d node_modules ]; then
-  echo "First-time setup: installing dependencies. This only happens once"
-  echo "and may take a few minutes..."
+  echo "First-time setup: installing dependencies. This may take a"
+  echo "few minutes the first time..."
   echo
-  if ! npm install; then
-    echo
-    echo "[ERROR] npm install failed. See the messages above."
-    read -rp "Press Enter to close this window..." _
-    exit 1
-  fi
+else
+  echo "Syncing dependencies (quick if nothing changed)..."
 fi
 
+if ! npm install --no-audit --no-fund --loglevel=error; then
+  echo
+  echo "[ERROR] npm install failed. See the messages above."
+  read -rp "Press Enter to close this window..." _
+  exit 1
+fi
+
+echo
 echo "Launching the app... (this window stays open while the app is running)"
 echo "Close this window or press Ctrl+C to stop the app."
 echo
