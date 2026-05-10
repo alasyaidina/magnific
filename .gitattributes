@@ -1,0 +1,6 @@
+# Force native line endings for shell launchers so they execute correctly
+# regardless of the user's git autocrlf setting.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.command   text eol=lf
+*.sh        text eol=lf

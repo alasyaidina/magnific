@@ -35,6 +35,9 @@ Electron main process — your API key never touches the renderer.
 
 ```
 .
+├── Start Magnific.bat        # Windows one-click launcher
+├── Start Magnific.command    # macOS one-click launcher
+├── Start Magnific.sh         # Linux one-click launcher
 ├── package.json
 ├── vite.config.js
 ├── tailwind.config.js
@@ -59,7 +62,27 @@ Electron main process — your API key never touches the renderer.
 └── .env.example
 ```
 
-## Setup
+## Quick start (one-click launchers)
+
+After cloning the repo, **double-click** the launcher for your operating
+system — it installs dependencies on first run and starts the app. You only
+need [Node.js 20 or newer](https://nodejs.org/) installed beforehand.
+
+| Operating system | Double-click this file       |
+| ---------------- | ---------------------------- |
+| Windows          | `Start Magnific.bat`         |
+| macOS            | `Start Magnific.command`     |
+| Linux            | `Start Magnific.sh`          |
+
+> macOS may show *“cannot be opened because it is from an unidentified
+> developer”* the first time. Right-click the file → **Open** → **Open**, or
+> run `xattr -d com.apple.quarantine "Start Magnific.command"` once.
+>
+> On Linux, some file managers default to opening `.sh` files in a text
+> editor. Either run from a terminal (`./Start\ Magnific.sh`) or set the file
+> manager to "Run executable text files" / "Run in Terminal".
+
+## Setup (manual / for developers)
 
 ```bash
 npm install
