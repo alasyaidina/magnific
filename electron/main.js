@@ -193,16 +193,12 @@ function mimeFor(filename) {
 // retains files for ~3 hours, which is comfortably longer than the
 // app's 10-minute polling window. The previous transfer.sh host has
 // been intermittently down (ECONNREFUSED in the field).
-async function uploadToHost(filePath) {
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`File not found: ${filePath}`);
-  }
-  const buf = fs.readFileSync(filePath);
-  const filename = path.basename(filePath);
+async function putToHost(buffer, filename) {
+  const safeName = filename || `upload-${Date.now()}.bin`;
   const form = new FormData();
-  form.append('files[]', buf, {
-    filename,
-    contentType: mimeFor(filename),
+  form.append('files[]', buffer, {
+    filename: safeName,
+    contentType: mimeFor(safeName),
   });
   const resp = await axios.post('https://uguu.se/upload', form, {
     headers: form.getHeaders(),
@@ -221,6 +217,14 @@ async function uploadToHost(filePath) {
     throw new Error('Upload host did not return a valid URL');
   }
   return publicUrl;
+}
+
+async function uploadFromPath(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+  const buf = fs.readFileSync(filePath);
+  return putToHost(buf, path.basename(filePath));
 }
 
 // ---------- Polling ----------
@@ -343,9 +347,34 @@ function registerIpc() {
     };
   });
 
-  // -- Upload to transfer.sh --
+  // -- Upload a local file to a temporary public host (uguu.se) --
   ipcMain.handle('upload-file', async (_e, filePath) => {
-    return uploadToHost(filePath);
+    return uploadFromPath(filePath);
+  });
+
+  // -- Upload an in-memory buffer (e.g. a cropped image from the renderer) --
+  ipcMain.handle('upload-buffer', async (_e, payload) => {
+    const { filename, dataBase64 } = payload || {};
+    if (typeof dataBase64 !== 'string' || !dataBase64) {
+      throw new Error('upload-buffer: dataBase64 is required');
+    }
+    const buf = Buffer.from(dataBase64, 'base64');
+    if (!buf.length) throw new Error('upload-buffer: empty buffer');
+    return putToHost(buf, filename);
+  });
+
+  // -- Read a local file and return base64 (for previewing in the renderer) --
+  ipcMain.handle('read-file-base64', async (_e, filePath) => {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    const buf = fs.readFileSync(filePath);
+    return {
+      name: path.basename(filePath),
+      size: buf.length,
+      mime: mimeFor(filePath),
+      dataBase64: buf.toString('base64'),
+    };
   });
 
   // -- Submit Motion Control task --

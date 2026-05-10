@@ -17,6 +17,12 @@ Electron main process — your API key never touches the renderer.
   the active key with one click, and the app will automatically fall back to
   the next available key on `429` (rate limit) or `402` (insufficient credits)
   responses.
+- **Aspect ratio cropper (pre-upload)** — after picking a character image,
+  choose a ratio (1:1, 9:16, 16:9, 4:3) and drag the crop box in a modal
+  before submission. The cropped JPEG is uploaded in place of the original.
+  Pick **Free** to skip cropping and upload the source as-is. The Magnific
+  request body is unchanged — output orientation is still derived from the
+  uploaded image.
 - **Resume polling on restart** — any task still `IN_PROGRESS` when the app
   closes will be polled again on next launch.
 
@@ -126,6 +132,9 @@ first key you add becomes the active key automatically.
 In the **Generator** tab:
 
 - Choose a character image (JPG/PNG/WEBP, ≥300px on the short side, ≤10MB).
+- (Optional) Pick an aspect ratio button below the image picker — **1:1**,
+  **9:16**, **16:9**, or **4:3** opens a crop modal; **Free** uploads the
+  original image untouched.
 - Choose a reference motion video (MP4/MOV, 3–30s, ≤100MB).
 - (Optional) Type a prompt up to 2,500 characters.
 - Toggle quality between **Pro 1080p** and **Standard 720p**.

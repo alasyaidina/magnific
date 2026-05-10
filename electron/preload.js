@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('api', {
   // file pickers + uploads
   selectFile: (kind) => ipcRenderer.invoke('dialog:select-file', kind),
   uploadFile: (filePath) => ipcRenderer.invoke('upload-file', filePath),
+  uploadBuffer: (payload) => ipcRenderer.invoke('upload-buffer', payload),
+  readFile: (filePath) => ipcRenderer.invoke('read-file-base64', filePath),
 
   // task lifecycle
   submitTask: (payload) => ipcRenderer.invoke('submit-task', payload),
