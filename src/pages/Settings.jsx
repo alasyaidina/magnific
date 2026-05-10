@@ -231,7 +231,7 @@ export default function Settings({ keys }) {
         <p className="text-xs text-gray-400 mt-2 leading-relaxed">
           All Magnific API requests are made from the Electron main process.
           Local files are uploaded to a temporary public URL via{' '}
-          <span className="font-mono">transfer.sh</span> before being sent to
+          <span className="font-mono">uguu.se</span> before being sent to
           the API. Tasks and keys are persisted via{' '}
           <span className="font-mono">electron-store</span>; in-progress tasks
           resume polling on app restart.
