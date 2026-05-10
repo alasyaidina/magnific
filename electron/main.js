@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const { pipeline } = require('node:stream/promises');
 const Store = require('electron-store');
 const axios = require('axios');
+const FormData = require('form-data');
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const isDev = !!DEV_URL;
@@ -172,7 +173,7 @@ function deleteTaskById(id) {
   return tasks;
 }
 
-// ---------- Helpers: file upload to transfer.sh ----------
+// ---------- Helpers: temporary public upload (uguu.se) ----------
 
 const MIME_BY_EXT = {
   '.jpg': 'image/jpeg',
@@ -188,32 +189,42 @@ function mimeFor(filename) {
   return MIME_BY_EXT[path.extname(filename).toLowerCase()] || 'application/octet-stream';
 }
 
-async function putToTransferSh(buffer, filename) {
-  const safeName = encodeURIComponent(filename || `upload-${Date.now()}.bin`);
-  const url = `https://transfer.sh/${safeName}`;
-  const resp = await axios.put(url, buffer, {
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': buffer.length ?? buffer.byteLength,
-    },
+// uguu.se accepts up to 128 MB per file via multipart/form-data POST and
+// retains files for ~3 hours, which is comfortably longer than the
+// app's 10-minute polling window. The previous transfer.sh host has
+// been intermittently down (ECONNREFUSED in the field).
+async function putToHost(buffer, filename) {
+  const safeName = filename || `upload-${Date.now()}.bin`;
+  const form = new FormData();
+  form.append('files[]', buffer, {
+    filename: safeName,
+    contentType: mimeFor(safeName),
+  });
+  const resp = await axios.post('https://uguu.se/upload', form, {
+    headers: form.getHeaders(),
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     timeout: 5 * 60_000,
     validateStatus: (s) => s >= 200 && s < 300,
   });
-  const publicUrl = String(resp.data || '').trim();
-  if (!/^https?:\/\//i.test(publicUrl)) {
-    throw new Error('transfer.sh did not return a valid URL');
+  const data = resp.data || {};
+  if (data.success === false) {
+    throw new Error(data.description || 'Upload host rejected the file');
+  }
+  const file = Array.isArray(data.files) ? data.files[0] : null;
+  const publicUrl = file?.url;
+  if (!publicUrl || !/^https?:\/\//i.test(publicUrl)) {
+    throw new Error('Upload host did not return a valid URL');
   }
   return publicUrl;
 }
 
-async function uploadToTransferSh(filePath) {
+async function uploadFromPath(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
   }
   const buf = fs.readFileSync(filePath);
-  return putToTransferSh(buf, path.basename(filePath));
+  return putToHost(buf, path.basename(filePath));
 }
 
 // ---------- Polling ----------
@@ -336,9 +347,9 @@ function registerIpc() {
     };
   });
 
-  // -- Upload to transfer.sh --
+  // -- Upload a local file to a temporary public host (uguu.se) --
   ipcMain.handle('upload-file', async (_e, filePath) => {
-    return uploadToTransferSh(filePath);
+    return uploadFromPath(filePath);
   });
 
   // -- Upload an in-memory buffer (e.g. a cropped image from the renderer) --
@@ -349,7 +360,7 @@ function registerIpc() {
     }
     const buf = Buffer.from(dataBase64, 'base64');
     if (!buf.length) throw new Error('upload-buffer: empty buffer');
-    return putToTransferSh(buf, filename);
+    return putToHost(buf, filename);
   });
 
   // -- Read a local file and return base64 (for previewing in the renderer) --

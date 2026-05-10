@@ -35,7 +35,8 @@ Electron main process — your API key never touches the renderer.
 - `electron-store` for persistence
 - No backend server. The Magnific API is called directly from the main
   process; local files are uploaded to a temporary public URL via
-  [transfer.sh](https://transfer.sh) before being submitted.
+  [uguu.se](https://uguu.se) before being submitted (3-hour retention,
+  128 MB per file).
 
 ## Project layout
 
@@ -141,7 +142,7 @@ In the **Generator** tab:
 - Adjust `cfg_scale` (0–1, default 0.5).
 - Click **Submit task**.
 
-The app uploads each file to `transfer.sh`, submits the job to the appropriate
+The app uploads each file to `uguu.se`, submits the job to the appropriate
 Magnific endpoint, and polls every 5 seconds (max 10 minutes) until the task is
 `COMPLETED` or `FAILED`. A live preview and **Download** button appear when
 the result is ready.
@@ -190,8 +191,8 @@ Authentication header on every call: `x-magnific-api-key: {API_KEY}`.
       "status": "CREATED|IN_PROGRESS|COMPLETED|FAILED",
       "quality": "pro|std",
       "prompt": "…",
-      "imageUrl": "https://transfer.sh/…",
-      "videoUrl": "https://transfer.sh/…",
+      "imageUrl": "https://*.uguu.se/…",
+      "videoUrl": "https://*.uguu.se/…",
       "resultUrl": "https://…",
       "createdAt": "2025-01-01T00:00:00.000Z"
     }
@@ -211,6 +212,6 @@ The app does not require any environment variables — keys live in
   `electron/preload.js` through `contextBridge`. The renderer never sees the
   raw API key.
 - Local file paths are read by the main process; only their public
-  `transfer.sh` URLs are sent to Magnific.
+  `uguu.se` URLs are sent to Magnific.
 - The browser window runs with `contextIsolation: true` and
   `nodeIntegration: false`.
