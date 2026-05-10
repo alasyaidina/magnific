@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const { pipeline } = require('node:stream/promises');
 const Store = require('electron-store');
 const axios = require('axios');
+const FormData = require('form-data');
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const isDev = !!DEV_URL;
@@ -172,31 +173,52 @@ function deleteTaskById(id) {
   return tasks;
 }
 
-// ---------- Helpers: file upload to transfer.sh ----------
+// ---------- Helpers: temporary public upload (uguu.se) ----------
 
-async function uploadToTransferSh(filePath) {
+const MIME_BY_EXT = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+};
+
+function mimeFor(filename) {
+  return MIME_BY_EXT[path.extname(filename).toLowerCase()] || 'application/octet-stream';
+}
+
+// uguu.se accepts up to 128 MB per file via multipart/form-data POST and
+// retains files for ~3 hours, which is comfortably longer than the
+// app's 10-minute polling window. The previous transfer.sh host has
+// been intermittently down (ECONNREFUSED in the field).
+async function uploadToHost(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
   }
-  const stat = fs.statSync(filePath);
-  const stream = fs.createReadStream(filePath);
-  const filename = encodeURIComponent(path.basename(filePath));
-  const url = `https://transfer.sh/${filename}`;
-
-  const resp = await axios.put(url, stream, {
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': stat.size,
-    },
+  const buf = fs.readFileSync(filePath);
+  const filename = path.basename(filePath);
+  const form = new FormData();
+  form.append('files[]', buf, {
+    filename,
+    contentType: mimeFor(filename),
+  });
+  const resp = await axios.post('https://uguu.se/upload', form, {
+    headers: form.getHeaders(),
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     timeout: 5 * 60_000,
     validateStatus: (s) => s >= 200 && s < 300,
   });
-
-  const publicUrl = String(resp.data || '').trim();
-  if (!/^https?:\/\//i.test(publicUrl)) {
-    throw new Error('transfer.sh did not return a valid URL');
+  const data = resp.data || {};
+  if (data.success === false) {
+    throw new Error(data.description || 'Upload host rejected the file');
+  }
+  const file = Array.isArray(data.files) ? data.files[0] : null;
+  const publicUrl = file?.url;
+  if (!publicUrl || !/^https?:\/\//i.test(publicUrl)) {
+    throw new Error('Upload host did not return a valid URL');
   }
   return publicUrl;
 }
@@ -323,7 +345,7 @@ function registerIpc() {
 
   // -- Upload to transfer.sh --
   ipcMain.handle('upload-file', async (_e, filePath) => {
-    return uploadToTransferSh(filePath);
+    return uploadToHost(filePath);
   });
 
   // -- Submit Motion Control task --
