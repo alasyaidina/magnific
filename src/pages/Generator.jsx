@@ -231,7 +231,11 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     if (!activeTask?.resultUrl) return;
     const safe = `magnific-${activeTask.id}.mp4`;
     try {
-      await window.api.downloadVideo({ url: activeTask.resultUrl, defaultName: safe });
+      await window.api.downloadVideo({
+        taskId: activeTask.id,
+        url: activeTask.resultUrl,
+        defaultName: safe,
+      });
     } catch (err) {
       setError(err?.message || 'Download failed');
     }

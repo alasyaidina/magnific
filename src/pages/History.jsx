@@ -9,6 +9,7 @@ export default function History({ tasks }) {
     setBusyId(task.id);
     try {
       await window.api.downloadVideo({
+        taskId: task.id,
         url: task.resultUrl,
         defaultName: `magnific-${task.id}.mp4`,
       });
