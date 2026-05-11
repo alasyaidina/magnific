@@ -173,7 +173,7 @@ function deleteTaskById(id) {
   return tasks;
 }
 
-// ---------- Helpers: temporary public upload (uguu.se) ----------
+// ---------- Helpers: temporary public upload ----------
 
 const MIME_BY_EXT = {
   '.jpg': 'image/jpeg',
@@ -189,19 +189,44 @@ function mimeFor(filename) {
   return MIME_BY_EXT[path.extname(filename).toLowerCase()] || 'application/octet-stream';
 }
 
+const UPLOAD_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Distil an axios / generic error down to a short, log-friendly string
+// that surfaces what the upload host actually said (status + body
+// snippet). Without this, axios's stock "Request failed with status
+// code 400" tells the user nothing.
+function describeUploadError(err) {
+  const r = err?.response;
+  if (r) {
+    let body = r.data;
+    if (typeof body !== 'string') {
+      try {
+        body = JSON.stringify(body);
+      } catch {
+        body = String(body);
+      }
+    }
+    body = (body || '').replace(/\s+/g, ' ').slice(0, 200);
+    return `HTTP ${r.status}${body ? ` — ${body}` : ''}`;
+  }
+  return err?.code || err?.message || String(err);
+}
+
 // uguu.se accepts up to 128 MB per file via multipart/form-data POST and
 // retains files for ~3 hours, which is comfortably longer than the
-// app's 10-minute polling window. The previous transfer.sh host has
-// been intermittently down (ECONNREFUSED in the field).
-async function putToHost(buffer, filename) {
-  const safeName = filename || `upload-${Date.now()}.bin`;
+// app's 10-minute polling window. It can still return 400/500 under
+// load (or when its rate-limit / anti-abuse heuristics trip), so we
+// fall back to tmpfiles.org as a second host.
+async function putToUguu(buffer, filename) {
   const form = new FormData();
   form.append('files[]', buffer, {
-    filename: safeName,
-    contentType: mimeFor(safeName),
+    filename,
+    contentType: mimeFor(filename),
   });
   const resp = await axios.post('https://uguu.se/upload', form, {
-    headers: form.getHeaders(),
+    headers: { ...form.getHeaders(), 'User-Agent': UPLOAD_UA },
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     timeout: 5 * 60_000,
@@ -209,14 +234,62 @@ async function putToHost(buffer, filename) {
   });
   const data = resp.data || {};
   if (data.success === false) {
-    throw new Error(data.description || 'Upload host rejected the file');
+    throw new Error(data.description || 'uguu.se rejected upload');
   }
   const file = Array.isArray(data.files) ? data.files[0] : null;
   const publicUrl = file?.url;
   if (!publicUrl || !/^https?:\/\//i.test(publicUrl)) {
-    throw new Error('Upload host did not return a valid URL');
+    throw new Error('uguu.se returned no URL');
   }
   return publicUrl;
+}
+
+// tmpfiles.org accepts up to 100 MB per file via multipart POST. The
+// JSON response carries a viewer URL like
+// "http://tmpfiles.org/{id}/{name}"; for a direct download we need
+// "https://tmpfiles.org/dl/{id}/{name}", which Magnific can fetch.
+async function putToTmpfiles(buffer, filename) {
+  const form = new FormData();
+  form.append('file', buffer, {
+    filename,
+    contentType: mimeFor(filename),
+  });
+  const resp = await axios.post('https://tmpfiles.org/api/v1/upload', form, {
+    headers: { ...form.getHeaders(), 'User-Agent': UPLOAD_UA },
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    timeout: 5 * 60_000,
+    validateStatus: (s) => s >= 200 && s < 300,
+  });
+  const data = resp.data || {};
+  const viewerUrl = data?.data?.url;
+  if (data.status !== 'success' || !viewerUrl) {
+    throw new Error('tmpfiles.org rejected upload');
+  }
+  return viewerUrl
+    .replace(/^http:\/\//i, 'https://')
+    .replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+}
+
+async function putToHost(buffer, filename) {
+  const safeName = filename || `upload-${Date.now()}.bin`;
+  const errors = [];
+
+  try {
+    return await putToUguu(buffer, safeName);
+  } catch (err) {
+    errors.push(`uguu.se: ${describeUploadError(err)}`);
+  }
+
+  try {
+    return await putToTmpfiles(buffer, safeName);
+  } catch (err) {
+    errors.push(`tmpfiles.org: ${describeUploadError(err)}`);
+  }
+
+  throw new Error(
+    `All upload hosts failed for "${safeName}". ${errors.join(' | ')}`,
+  );
 }
 
 async function uploadFromPath(filePath) {
