@@ -310,6 +310,51 @@ function stopPolling(taskId) {
   }
 }
 
+// Magnific's poll response uses different field names for failures
+// depending on quality / endpoint variant. Surface whatever the server
+// actually returned so the user sees the real reason instead of a flat
+// "Task failed".
+function extractFailureReason(inner) {
+  if (!inner || typeof inner !== 'object') return null;
+  const candidates = [
+    inner.failure_reason,
+    inner.failed_reason,
+    inner.fail_reason,
+    inner.error_message,
+    inner.errorMessage,
+    inner.error,
+    inner.reason,
+    inner.message,
+    inner.detail,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim().slice(0, 500);
+    if (c && typeof c === 'object') {
+      if (typeof c.message === 'string' && c.message.trim()) return c.message.trim().slice(0, 500);
+      if (typeof c.detail === 'string' && c.detail.trim()) return c.detail.trim().slice(0, 500);
+    }
+  }
+  // Last resort: serialize whatever non-standard fields we got so the
+  // user can at least see *something* meaningful.
+  const known = new Set([
+    'task_id', 'id', 'status', 'generated',
+    'created_at', 'createdAt', 'updated_at', 'updatedAt',
+    'started_at', 'finished_at',
+  ]);
+  const extras = {};
+  for (const [k, v] of Object.entries(inner)) {
+    if (!known.has(k) && v != null && v !== '') extras[k] = v;
+  }
+  if (Object.keys(extras).length) {
+    try {
+      return JSON.stringify(extras).slice(0, 500);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 function startPolling(taskId) {
   if (pollers.has(taskId)) return;
   const startedAt = Date.now();
@@ -324,11 +369,13 @@ function startPolling(taskId) {
       const status = inner.status || 'IN_PROGRESS';
       const generated = Array.isArray(inner.generated) ? inner.generated : [];
       const resultUrl = generated.find(Boolean) || null;
+      const failureReason = status === 'FAILED' ? extractFailureReason(inner) : null;
 
       upsertTask({
         id: taskId,
         status,
         ...(resultUrl ? { resultUrl } : {}),
+        ...(failureReason ? { lastError: failureReason } : {}),
         lastPolledAt: new Date().toISOString(),
       });
 
@@ -505,13 +552,15 @@ function registerIpc() {
     const status = inner.status || 'IN_PROGRESS';
     const generated = Array.isArray(inner.generated) ? inner.generated : [];
     const resultUrl = generated.find(Boolean) || null;
+    const failureReason = status === 'FAILED' ? extractFailureReason(inner) : null;
     upsertTask({
       id: taskId,
       status,
       ...(resultUrl ? { resultUrl } : {}),
+      ...(failureReason ? { lastError: failureReason } : {}),
       lastPolledAt: new Date().toISOString(),
     });
-    return { taskId, status, resultUrl };
+    return { taskId, status, resultUrl, failureReason };
   });
 
   // -- Download result video to user-chosen folder --
