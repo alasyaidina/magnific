@@ -48,4 +48,43 @@
   .badge {
     @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium;
   }
+
+  /* ---- VibeTool.Club branding helpers ---- */
+  .vibe-gradient-text {
+    background: linear-gradient(
+      90deg,
+      #ff5fa2 0%,
+      #a855f7 35%,
+      #6366f1 65%,
+      #22d3ee 100%
+    );
+    background-size: 200% 200%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: vibe-shine 6s ease-in-out infinite;
+  }
+  .vibe-gradient-bg {
+    background: linear-gradient(
+      135deg,
+      #ff5fa2 0%,
+      #a855f7 50%,
+      #22d3ee 100%
+    );
+  }
+  .vibe-badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-white shadow-md shadow-fuchsia-900/30;
+    background: linear-gradient(
+      90deg,
+      #ff5fa2 0%,
+      #a855f7 50%,
+      #22d3ee 100%
+    );
+  }
+  .vibe-glow {
+    box-shadow:
+      0 0 30px rgba(168, 85, 247, 0.35),
+      0 0 60px rgba(34, 211, 238, 0.2);
+  }
 }
