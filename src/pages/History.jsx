@@ -92,6 +92,14 @@ export default function History({ tasks }) {
                   <td className="px-5 py-3 text-gray-400">{duration}</td>
                   <td className="px-5 py-3 text-gray-300 max-w-xs truncate" title={t.prompt}>
                     {t.prompt || <span className="text-gray-500 italic">—</span>}
+                    {t.status === 'FAILED' && t.lastError && (
+                      <div
+                        className="text-xs text-red-300 mt-1 truncate"
+                        title={t.lastError}
+                      >
+                        {t.lastError}
+                      </div>
+                    )}
                   </td>
                   <td className="px-5 py-3 text-right space-x-2 whitespace-nowrap">
                     {t.status === 'COMPLETED' && t.resultUrl && (
