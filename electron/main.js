@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pipeline } = require('node:stream/promises');
+const crypto = require('node:crypto');
 const Store = require('electron-store');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -23,16 +24,19 @@ const ENDPOINT_POLL = (taskId) =>
 const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-// Persistent store
+// Persistent store. New fields added in this version:
+//   * keys[].exhausted / exhaustedAt / exhaustedReason / completedCount / failedCount
+//   * tasks[].assignedKeyId / request / localPath / localDownloadError
+//   * outputFolder (string|null)
 const store = new Store({
   defaults: {
-    keys: [], // [{ id, label, value, isActive }]
-    tasks: [], // [{ id, status, quality, prompt, imageUrl, videoUrl, resultUrl, createdAt, ... }]
+    keys: [],
+    tasks: [],
+    outputFolder: null,
   },
 });
 
-// In-memory polling timers, keyed by task id
-const pollers = new Map();
+// ---------- Windows / UI plumbing ----------
 
 let mainWindow = null;
 
@@ -64,7 +68,17 @@ function createWindow() {
   });
 }
 
-// ---------- Helpers: keys & API ----------
+function notifyAllRenderers(channel, payload) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send(channel, payload);
+  }
+}
+
+function broadcastToast(type, message) {
+  notifyAllRenderers('toast', { type, message });
+}
+
+// ---------- Store helpers ----------
 
 function getKeys() {
   return store.get('keys') || [];
@@ -72,88 +86,25 @@ function getKeys() {
 
 function setKeys(keys) {
   store.set('keys', keys);
+  notifyAllRenderers('keys:changed', keys);
 }
 
-function getActiveKeyIndex(keys) {
-  const idx = keys.findIndex((k) => k.isActive);
-  if (idx >= 0) return idx;
-  return keys.length > 0 ? 0 : -1;
-}
-
-function notifyAllRenderers(channel, payload) {
-  for (const w of BrowserWindow.getAllWindows()) {
-    w.webContents.send(channel, payload);
-  }
-}
-
-/**
- * Performs a Magnific API request with multi-key fallback on 429/402.
- * Returns response.data on success. Throws on terminal error.
- */
-async function callMagnific({ method, url, data }) {
+function patchKey(keyId, patch) {
   const keys = getKeys();
-  if (keys.length === 0) {
-    throw new Error('No API key configured. Add a key in Settings.');
-  }
-
-  let activeIdx = getActiveKeyIndex(keys);
-  const tried = new Set();
-  let lastError = null;
-
-  while (activeIdx >= 0 && !tried.has(keys[activeIdx].id)) {
-    const key = keys[activeIdx];
-    tried.add(key.id);
-
-    try {
-      const resp = await axios({
-        method,
-        url,
-        headers: {
-          'x-magnific-api-key': key.value,
-          'Content-Type': 'application/json',
-        },
-        data: data ?? undefined,
-        timeout: 60_000,
-        validateStatus: (s) => s >= 200 && s < 300,
-      });
-      return resp.data;
-    } catch (err) {
-      lastError = err;
-      const status = err.response?.status;
-      if ((status === 429 || status === 402) && keys.length > 1) {
-        // Find the next untried key.
-        const nextIdx = keys.findIndex(
-          (k, i) => i !== activeIdx && !tried.has(k.id),
-        );
-        if (nextIdx < 0) {
-          throw new Error('All API keys have insufficient credits');
-        }
-        // Promote the next key to active and persist.
-        keys.forEach((k, i) => {
-          k.isActive = i === nextIdx;
-        });
-        setKeys(keys);
-        activeIdx = nextIdx;
-        notifyAllRenderers('keys:changed', keys);
-        notifyAllRenderers('toast', {
-          type: 'warning',
-          message: `Switched to ${keys[nextIdx].label} due to credit limit`,
-        });
-        continue;
-      }
-      // Non-recoverable error.
-      throw err;
-    }
-  }
-
-  if (lastError) throw lastError;
-  throw new Error('All API keys have insufficient credits');
+  const idx = keys.findIndex((k) => k.id === keyId);
+  if (idx < 0) return null;
+  keys[idx] = { ...keys[idx], ...patch };
+  setKeys(keys);
+  return keys[idx];
 }
-
-// ---------- Helpers: tasks store ----------
 
 function getTasks() {
   return store.get('tasks') || [];
+}
+
+function setTasks(tasks) {
+  store.set('tasks', tasks);
+  notifyAllRenderers('tasks:changed', tasks);
 }
 
 function upsertTask(task) {
@@ -161,19 +112,172 @@ function upsertTask(task) {
   const idx = tasks.findIndex((t) => t.id === task.id);
   if (idx >= 0) tasks[idx] = { ...tasks[idx], ...task };
   else tasks.unshift(task);
-  store.set('tasks', tasks);
-  notifyAllRenderers('tasks:changed', tasks);
-  return tasks;
+  setTasks(tasks);
+  return tasks[idx >= 0 ? idx : 0];
 }
 
 function deleteTaskById(id) {
   const tasks = getTasks().filter((t) => t.id !== id);
-  store.set('tasks', tasks);
-  notifyAllRenderers('tasks:changed', tasks);
+  setTasks(tasks);
   return tasks;
 }
 
-// ---------- Helpers: temporary public upload ----------
+function uuid() {
+  return crypto.randomUUID();
+}
+
+// ---------- Magnific helpers ----------
+
+/**
+ * One-shot Magnific request bound to a specific API key. Throws the raw
+ * axios error so callers can inspect `err.response?.status` (used by the
+ * scheduler to decide between "retry on another key", "mark key
+ * exhausted", and "fail the task").
+ */
+async function callMagnificWithKey({ method, url, data, apiKey }) {
+  const resp = await axios({
+    method,
+    url,
+    headers: {
+      'x-magnific-api-key': apiKey,
+      'Content-Type': 'application/json',
+    },
+    data: data ?? undefined,
+    timeout: 60_000,
+    validateStatus: (s) => s >= 200 && s < 300,
+  });
+  return resp.data;
+}
+
+/**
+ * Convenience wrapper that resolves the API key automatically: prefers
+ * any non-exhausted key, falling back to the (legacy) active key. Used
+ * by non-queue paths like download-video.
+ */
+async function callMagnificAny({ method, url, data }) {
+  const keys = getKeys();
+  if (keys.length === 0) {
+    throw new Error('No API key configured. Add a key in Settings.');
+  }
+  const candidates = [
+    ...keys.filter((k) => !k.exhausted && k.isActive),
+    ...keys.filter((k) => !k.exhausted && !k.isActive),
+    ...keys.filter((k) => k.exhausted), // last-ditch: try exhausted ones too
+  ];
+  let lastErr = null;
+  for (const k of candidates) {
+    try {
+      return await callMagnificWithKey({ method, url, data, apiKey: k.value });
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      if (status === 402 || isInsufficientCredits(err)) {
+        markKeyExhausted(k.id, describeApiError(err));
+        continue;
+      }
+      if (status === 429) continue;
+      throw err; // non-credit failures propagate immediately
+    }
+  }
+  throw lastErr || new Error('All API keys failed');
+}
+
+const CREDIT_REGEX = /credit|quota|insufficient|exhaust|out\s*of|limit\s*reach/i;
+
+function isInsufficientCredits(err) {
+  const status = err?.response?.status;
+  if (status === 402) return true;
+  const body = err?.response?.data;
+  const txt =
+    typeof body === 'string'
+      ? body
+      : body && typeof body === 'object'
+        ? JSON.stringify(body)
+        : '';
+  return CREDIT_REGEX.test(txt);
+}
+
+function describeApiError(err) {
+  const r = err?.response;
+  if (r) {
+    let body = r.data;
+    if (typeof body !== 'string') {
+      try {
+        body = JSON.stringify(body);
+      } catch {
+        body = String(body);
+      }
+    }
+    body = (body || '').replace(/\s+/g, ' ').slice(0, 200);
+    return `HTTP ${r.status}${body ? ` — ${body}` : ''}`;
+  }
+  return err?.code || err?.message || String(err);
+}
+
+function markKeyExhausted(keyId, reason) {
+  const keys = getKeys();
+  const k = keys.find((x) => x.id === keyId);
+  if (!k || k.exhausted) return;
+  k.exhausted = true;
+  k.exhaustedAt = new Date().toISOString();
+  k.exhaustedReason = reason || 'Marked as out of credits';
+  setKeys(keys);
+  broadcastToast(
+    'warning',
+    `Key "${k.label}" marked Habis — skipping in queue. ${reason || ''}`.trim(),
+  );
+}
+
+/**
+ * Magnific's poll response uses different field names for failures
+ * depending on quality / endpoint variant. Surface whatever the server
+ * actually returned so the user sees the real reason instead of a flat
+ * "Task failed".
+ */
+function extractFailureReason(inner) {
+  if (!inner || typeof inner !== 'object') return null;
+  const candidates = [
+    inner.failure_reason,
+    inner.failed_reason,
+    inner.fail_reason,
+    inner.error_message,
+    inner.errorMessage,
+    inner.error,
+    inner.reason,
+    inner.message,
+    inner.detail,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim().slice(0, 500);
+    if (c && typeof c === 'object') {
+      if (typeof c.message === 'string' && c.message.trim()) {
+        return c.message.trim().slice(0, 500);
+      }
+      if (typeof c.detail === 'string' && c.detail.trim()) {
+        return c.detail.trim().slice(0, 500);
+      }
+    }
+  }
+  const known = new Set([
+    'task_id', 'id', 'status', 'generated',
+    'created_at', 'createdAt', 'updated_at', 'updatedAt',
+    'started_at', 'finished_at',
+  ]);
+  const extras = {};
+  for (const [k, v] of Object.entries(inner)) {
+    if (!known.has(k) && v != null && v !== '') extras[k] = v;
+  }
+  if (Object.keys(extras).length) {
+    try {
+      return JSON.stringify(extras).slice(0, 500);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// ---------- Temporary public upload (uguu.se + tmpfiles.org fallback) ----------
 
 const MIME_BY_EXT = {
   '.jpg': 'image/jpeg',
@@ -193,38 +297,13 @@ const UPLOAD_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// Distil an axios / generic error down to a short, log-friendly string
-// that surfaces what the upload host actually said (status + body
-// snippet). Without this, axios's stock "Request failed with status
-// code 400" tells the user nothing.
 function describeUploadError(err) {
-  const r = err?.response;
-  if (r) {
-    let body = r.data;
-    if (typeof body !== 'string') {
-      try {
-        body = JSON.stringify(body);
-      } catch {
-        body = String(body);
-      }
-    }
-    body = (body || '').replace(/\s+/g, ' ').slice(0, 200);
-    return `HTTP ${r.status}${body ? ` — ${body}` : ''}`;
-  }
-  return err?.code || err?.message || String(err);
+  return describeApiError(err);
 }
 
-// uguu.se accepts up to 128 MB per file via multipart/form-data POST and
-// retains files for ~3 hours, which is comfortably longer than the
-// app's 10-minute polling window. It can still return 400/500 under
-// load (or when its rate-limit / anti-abuse heuristics trip), so we
-// fall back to tmpfiles.org as a second host.
 async function putToUguu(buffer, filename) {
   const form = new FormData();
-  form.append('files[]', buffer, {
-    filename,
-    contentType: mimeFor(filename),
-  });
+  form.append('files[]', buffer, { filename, contentType: mimeFor(filename) });
   const resp = await axios.post('https://uguu.se/upload', form, {
     headers: { ...form.getHeaders(), 'User-Agent': UPLOAD_UA },
     maxBodyLength: Infinity,
@@ -244,16 +323,9 @@ async function putToUguu(buffer, filename) {
   return publicUrl;
 }
 
-// tmpfiles.org accepts up to 100 MB per file via multipart POST. The
-// JSON response carries a viewer URL like
-// "http://tmpfiles.org/{id}/{name}"; for a direct download we need
-// "https://tmpfiles.org/dl/{id}/{name}", which Magnific can fetch.
 async function putToTmpfiles(buffer, filename) {
   const form = new FormData();
-  form.append('file', buffer, {
-    filename,
-    contentType: mimeFor(filename),
-  });
+  form.append('file', buffer, { filename, contentType: mimeFor(filename) });
   const resp = await axios.post('https://tmpfiles.org/api/v1/upload', form, {
     headers: { ...form.getHeaders(), 'User-Agent': UPLOAD_UA },
     maxBodyLength: Infinity,
@@ -274,19 +346,16 @@ async function putToTmpfiles(buffer, filename) {
 async function putToHost(buffer, filename) {
   const safeName = filename || `upload-${Date.now()}.bin`;
   const errors = [];
-
   try {
     return await putToUguu(buffer, safeName);
   } catch (err) {
     errors.push(`uguu.se: ${describeUploadError(err)}`);
   }
-
   try {
     return await putToTmpfiles(buffer, safeName);
   } catch (err) {
     errors.push(`tmpfiles.org: ${describeUploadError(err)}`);
   }
-
   throw new Error(
     `All upload hosts failed for "${safeName}". ${errors.join(' | ')}`,
   );
@@ -300,143 +369,452 @@ async function uploadFromPath(filePath) {
   return putToHost(buf, path.basename(filePath));
 }
 
-// ---------- Polling ----------
+// ---------- Auto-download to user-configured folder ----------
 
-function stopPolling(taskId) {
-  const handle = pollers.get(taskId);
-  if (handle) {
-    clearTimeout(handle.timer);
-    pollers.delete(taskId);
-  }
-}
-
-// Magnific's poll response uses different field names for failures
-// depending on quality / endpoint variant. Surface whatever the server
-// actually returned so the user sees the real reason instead of a flat
-// "Task failed".
-function extractFailureReason(inner) {
-  if (!inner || typeof inner !== 'object') return null;
-  const candidates = [
-    inner.failure_reason,
-    inner.failed_reason,
-    inner.fail_reason,
-    inner.error_message,
-    inner.errorMessage,
-    inner.error,
-    inner.reason,
-    inner.message,
-    inner.detail,
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.trim()) return c.trim().slice(0, 500);
-    if (c && typeof c === 'object') {
-      if (typeof c.message === 'string' && c.message.trim()) return c.message.trim().slice(0, 500);
-      if (typeof c.detail === 'string' && c.detail.trim()) return c.detail.trim().slice(0, 500);
-    }
-  }
-  // Last resort: serialize whatever non-standard fields we got so the
-  // user can at least see *something* meaningful.
-  const known = new Set([
-    'task_id', 'id', 'status', 'generated',
-    'created_at', 'createdAt', 'updated_at', 'updatedAt',
-    'started_at', 'finished_at',
-  ]);
-  const extras = {};
-  for (const [k, v] of Object.entries(inner)) {
-    if (!known.has(k) && v != null && v !== '') extras[k] = v;
-  }
-  if (Object.keys(extras).length) {
+async function downloadResultToFolder({ task, outFolder }) {
+  if (!outFolder) return null;
+  if (!fs.existsSync(outFolder)) {
     try {
-      return JSON.stringify(extras).slice(0, 500);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function startPolling(taskId) {
-  if (pollers.has(taskId)) return;
-  const startedAt = Date.now();
-
-  const tick = async () => {
-    try {
-      const data = await callMagnific({
-        method: 'get',
-        url: ENDPOINT_POLL(taskId),
-      });
-      const inner = data?.data || data || {};
-      const status = inner.status || 'IN_PROGRESS';
-      const generated = Array.isArray(inner.generated) ? inner.generated : [];
-      const resultUrl = generated.find(Boolean) || null;
-      const failureReason = status === 'FAILED' ? extractFailureReason(inner) : null;
-
-      upsertTask({
-        id: taskId,
-        status,
-        ...(resultUrl ? { resultUrl } : {}),
-        ...(failureReason ? { lastError: failureReason } : {}),
-        lastPolledAt: new Date().toISOString(),
-      });
-
-      if (status === 'COMPLETED' || status === 'FAILED') {
-        stopPolling(taskId);
-        return;
-      }
+      fs.mkdirSync(outFolder, { recursive: true });
     } catch (err) {
-      const tasks = getTasks();
-      const t = tasks.find((x) => x.id === taskId);
-      // Surface a transient error but keep polling unless we've timed out.
-      if (t) {
-        upsertTask({
-          id: taskId,
-          lastError: err.response?.data?.message || err.message || String(err),
-          lastPolledAt: new Date().toISOString(),
-        });
+      throw new Error(`Output folder not writable: ${err.message}`);
+    }
+  }
+  if (!task.resultUrl) return null;
+
+  const filename = makeAutoDownloadName(task);
+  const target = path.join(outFolder, filename);
+
+  // Try with the task's assigned key first (most likely the one that
+  // owns the URL), then with any other non-exhausted key, then unauthed.
+  const keys = getKeys();
+  const ordered = [];
+  if (task.assignedKeyId) {
+    const k = keys.find((x) => x.id === task.assignedKeyId);
+    if (k) ordered.push(k);
+  }
+  for (const k of keys) {
+    if (!ordered.includes(k) && !k.exhausted) ordered.push(k);
+  }
+
+  async function attempt(headers) {
+    const resp = await axios.get(task.resultUrl, {
+      headers,
+      responseType: 'stream',
+      timeout: 5 * 60_000,
+      maxRedirects: 5,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
+    await pipeline(resp.data, fs.createWriteStream(target));
+  }
+
+  let lastErr = null;
+  const baseHeaders = { 'User-Agent': UPLOAD_UA, Accept: 'video/mp4,*/*' };
+
+  for (const k of ordered) {
+    try {
+      await attempt({ ...baseHeaders, 'x-magnific-api-key': k.value });
+      return target;
+    } catch (err) {
+      lastErr = err;
+      if (err?.response?.status !== 401 && err?.response?.status !== 403) {
+        break;
       }
     }
+  }
+  // Last resort: unauthenticated.
+  try {
+    await attempt(baseHeaders);
+    return target;
+  } catch (err) {
+    lastErr = err;
+  }
+  throw lastErr || new Error('Download failed');
+}
 
-    if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+function makeAutoDownloadName(task) {
+  const slug = (task.prompt || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  const shortId = (task.magnificTaskId || task.id || '').split('-')[0] || 'task';
+  return slug ? `${slug}-${shortId}.mp4` : `magnific-${shortId}.mp4`;
+}
+
+// ---------- Scheduler: assigns queued tasks to free keys ----------
+
+// Maps keyId → running task id (in-memory; also reflected on key.activeTaskId).
+const keyBusy = new Map();
+// Maps magnificTaskId → poll timer handle.
+const pollers = new Map();
+
+function isKeyAvailable(key) {
+  return !key.exhausted && !keyBusy.get(key.id);
+}
+
+function nextQueuedTask() {
+  const tasks = getTasks();
+  // FIFO by createdAt within QUEUED state.
+  return tasks
+    .filter((t) => t.status === 'QUEUED')
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))[0];
+}
+
+let schedulerScheduled = false;
+function tickScheduler() {
+  // Debounce: many upserts will request a tick; only run once per turn.
+  if (schedulerScheduled) return;
+  schedulerScheduled = true;
+  setImmediate(() => {
+    schedulerScheduled = false;
+    runSchedulerOnce();
+  });
+}
+
+function runSchedulerOnce() {
+  const keys = getKeys();
+  const availableKeys = keys.filter(isKeyAvailable);
+  if (availableKeys.length === 0) {
+    const hasQueue = getTasks().some((t) => t.status === 'QUEUED');
+    if (hasQueue && keys.length > 0 && keys.every((k) => k.exhausted)) {
+      broadcastToast(
+        'error',
+        'All API keys are marked Habis — queue paused. Reset a key in API Management to continue.',
+      );
+    }
+    return;
+  }
+  for (const key of availableKeys) {
+    const task = nextQueuedTask();
+    if (!task) break;
+    assignAndRun(task.id, key.id);
+  }
+}
+
+function assignAndRun(taskId, keyId) {
+  keyBusy.set(keyId, taskId);
+  patchKey(keyId, { activeTaskId: taskId });
+  upsertTask({
+    id: taskId,
+    status: 'PREPARING',
+    assignedKeyId: keyId,
+    startedAt: new Date().toISOString(),
+  });
+
+  runJob(taskId, keyId).catch((err) => {
+    // runJob should handle all errors internally, but be defensive.
+    console.error('runJob crashed:', err);
+    upsertTask({
+      id: taskId,
+      status: 'FAILED',
+      lastError: err?.message || String(err),
+    });
+    finishTask(taskId, keyId, false);
+  });
+}
+
+function finishTask(taskId, keyId, completed) {
+  keyBusy.delete(keyId);
+  const keys = getKeys();
+  const k = keys.find((x) => x.id === keyId);
+  if (k) {
+    k.activeTaskId = null;
+    if (completed) k.completedCount = (k.completedCount || 0) + 1;
+    else k.failedCount = (k.failedCount || 0) + 1;
+    setKeys(keys);
+  }
+  tickScheduler();
+}
+
+async function runJob(taskId, keyId) {
+  const initial = getTasks().find((t) => t.id === taskId);
+  if (!initial) return;
+  const { request } = initial;
+  if (!request) {
+    upsertTask({
+      id: taskId,
+      status: 'FAILED',
+      lastError: 'Internal error: task has no request payload',
+    });
+    finishTask(taskId, keyId, false);
+    return;
+  }
+
+  const key = getKeys().find((k) => k.id === keyId);
+  if (!key) {
+    // Re-queue if the key disappeared.
+    upsertTask({ id: taskId, status: 'QUEUED', assignedKeyId: null });
+    keyBusy.delete(keyId);
+    tickScheduler();
+    return;
+  }
+
+  // 1) Uploads — only run for fields we don't already have.
+  let { imageUrl, videoUrl } = initial;
+  try {
+    if (!imageUrl) {
+      imageUrl = await uploadFromPath(request.imagePath);
+      upsertTask({ id: taskId, imageUrl });
+    }
+    if (!videoUrl) {
+      videoUrl = await uploadFromPath(request.videoPath);
+      upsertTask({ id: taskId, videoUrl });
+    }
+  } catch (err) {
+    upsertTask({
+      id: taskId,
+      status: 'FAILED',
+      lastError: `Upload failed: ${describeApiError(err)}`,
+    });
+    finishTask(taskId, keyId, false);
+    return;
+  }
+
+  // 2) Submit to Magnific with this specific key. Translate 402/credit
+  //    failures into key-exhaustion + re-queue.
+  upsertTask({ id: taskId, status: 'SUBMITTING' });
+  const endpoint = request.quality === 'std' ? ENDPOINT_STD : ENDPOINT_PRO;
+  const body = { image_url: imageUrl, video_url: videoUrl };
+  if (request.prompt) body.prompt = String(request.prompt).slice(0, 2500);
+  if (request.orientation) body.character_orientation = request.orientation;
+  if (typeof request.cfg_scale === 'number') body.cfg_scale = request.cfg_scale;
+
+  let magnificTaskId = null;
+  try {
+    const data = await callMagnificWithKey({
+      method: 'post',
+      url: endpoint,
+      data: body,
+      apiKey: key.value,
+    });
+    const inner = data?.data || data || {};
+    magnificTaskId = inner.task_id || inner.id;
+    if (!magnificTaskId) {
+      throw new Error('Magnific did not return a task_id');
+    }
+  } catch (err) {
+    if (isInsufficientCredits(err)) {
+      markKeyExhausted(keyId, describeApiError(err));
+      // Re-queue: another key may still be able to handle this job.
       upsertTask({
         id: taskId,
-        status: 'FAILED',
-        lastError: 'Polling timed out after 10 minutes',
+        status: 'QUEUED',
+        assignedKeyId: null,
+        lastError: `Key Habis: ${describeApiError(err)}`,
       });
-      stopPolling(taskId);
+      finishTask(taskId, keyId, false);
       return;
     }
+    if (err?.response?.status === 429) {
+      // Rate limited on this key — re-queue and let scheduler retry later.
+      upsertTask({
+        id: taskId,
+        status: 'QUEUED',
+        assignedKeyId: null,
+        lastError: `Rate-limited on key "${key.label}", will retry`,
+      });
+      finishTask(taskId, keyId, false);
+      return;
+    }
+    upsertTask({
+      id: taskId,
+      status: 'FAILED',
+      lastError: `Submit failed: ${describeApiError(err)}`,
+    });
+    finishTask(taskId, keyId, false);
+    return;
+  }
 
-    const handle = pollers.get(taskId);
-    if (!handle) return;
-    handle.timer = setTimeout(tick, POLL_INTERVAL_MS);
-  };
+  upsertTask({
+    id: taskId,
+    status: 'CREATED',
+    magnificTaskId,
+  });
 
-  const handle = { timer: setTimeout(tick, POLL_INTERVAL_MS) };
-  pollers.set(taskId, handle);
+  // 3) Poll until terminal status.
+  let finalStatus;
+  try {
+    finalStatus = await pollUntilTerminal(taskId, magnificTaskId, key.value);
+  } catch (err) {
+    if (isInsufficientCredits(err)) {
+      markKeyExhausted(keyId, describeApiError(err));
+    }
+    upsertTask({
+      id: taskId,
+      status: 'FAILED',
+      lastError: `Polling failed: ${describeApiError(err)}`,
+    });
+    finishTask(taskId, keyId, false);
+    return;
+  }
+
+  if (finalStatus.status !== 'COMPLETED') {
+    finishTask(taskId, keyId, false);
+    return;
+  }
+
+  // 4) Auto-download to the configured folder (best effort).
+  const outFolder = store.get('outputFolder');
+  if (outFolder) {
+    upsertTask({ id: taskId, status: 'DOWNLOADING' });
+    try {
+      const task = getTasks().find((t) => t.id === taskId);
+      const localPath = await downloadResultToFolder({
+        task: { ...task, assignedKeyId: keyId },
+        outFolder,
+      });
+      upsertTask({
+        id: taskId,
+        status: 'DONE',
+        localPath,
+        completedAt: new Date().toISOString(),
+        localDownloadError: null,
+      });
+      broadcastToast('success', `Saved: ${path.basename(localPath)}`);
+    } catch (err) {
+      upsertTask({
+        id: taskId,
+        status: 'COMPLETED',
+        localDownloadError: describeApiError(err),
+        completedAt: new Date().toISOString(),
+      });
+      broadcastToast(
+        'error',
+        `Auto-download failed: ${describeApiError(err)}`,
+      );
+    }
+  } else {
+    upsertTask({
+      id: taskId,
+      status: 'COMPLETED',
+      completedAt: new Date().toISOString(),
+    });
+  }
+
+  finishTask(taskId, keyId, true);
 }
 
-function resumeInProgressPolling() {
-  const tasks = getTasks();
-  for (const t of tasks) {
-    if (t.status === 'CREATED' || t.status === 'IN_PROGRESS') {
-      startPolling(t.id);
+async function pollUntilTerminal(localTaskId, magnificTaskId, apiKey) {
+  const startedAt = Date.now();
+  for (;;) {
+    if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+      throw new Error('Polling timed out after 10 minutes');
+    }
+    await sleep(POLL_INTERVAL_MS);
+    const data = await callMagnificWithKey({
+      method: 'get',
+      url: ENDPOINT_POLL(magnificTaskId),
+      apiKey,
+    });
+    const inner = data?.data || data || {};
+    const status = inner.status || 'IN_PROGRESS';
+    const generated = Array.isArray(inner.generated) ? inner.generated : [];
+    const resultUrl = generated.find(Boolean) || null;
+    const failureReason = status === 'FAILED' ? extractFailureReason(inner) : null;
+    upsertTask({
+      id: localTaskId,
+      status: status === 'COMPLETED' || status === 'FAILED' ? status : 'IN_PROGRESS',
+      ...(resultUrl ? { resultUrl } : {}),
+      ...(failureReason ? { lastError: failureReason } : {}),
+      lastPolledAt: new Date().toISOString(),
+    });
+    if (status === 'COMPLETED' || status === 'FAILED') {
+      return { status, resultUrl, failureReason };
     }
   }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function resumeOnRestart() {
+  const tasks = getTasks();
+  for (const t of tasks) {
+    if (t.status === 'PREPARING' || t.status === 'SUBMITTING') {
+      // Mid-flight at the time of shutdown; re-queue so a free key picks
+      // it up again. The upload step is idempotent (it short-circuits if
+      // imageUrl / videoUrl already populated).
+      upsertTask({ id: t.id, status: 'QUEUED', assignedKeyId: null });
+    } else if (t.status === 'CREATED' || t.status === 'IN_PROGRESS') {
+      // Re-enter polling for this task using the previously assigned
+      // key (or any non-exhausted key as fallback).
+      const key = getKeys().find(
+        (k) => k.id === t.assignedKeyId && !k.exhausted,
+      ) || getKeys().find((k) => !k.exhausted);
+      if (!key) continue;
+      keyBusy.set(key.id, t.id);
+      patchKey(key.id, { activeTaskId: t.id });
+      (async () => {
+        try {
+          const status = await pollUntilTerminal(t.id, t.magnificTaskId, key.value);
+          if (status.status === 'COMPLETED') {
+            const outFolder = store.get('outputFolder');
+            if (outFolder) {
+              const cur = getTasks().find((x) => x.id === t.id);
+              upsertTask({ id: t.id, status: 'DOWNLOADING' });
+              try {
+                const localPath = await downloadResultToFolder({
+                  task: { ...cur, assignedKeyId: key.id },
+                  outFolder,
+                });
+                upsertTask({
+                  id: t.id,
+                  status: 'DONE',
+                  localPath,
+                  completedAt: new Date().toISOString(),
+                });
+              } catch (err) {
+                upsertTask({
+                  id: t.id,
+                  status: 'COMPLETED',
+                  localDownloadError: describeApiError(err),
+                  completedAt: new Date().toISOString(),
+                });
+              }
+            } else {
+              upsertTask({
+                id: t.id,
+                status: 'COMPLETED',
+                completedAt: new Date().toISOString(),
+              });
+            }
+            finishTask(t.id, key.id, true);
+          } else {
+            finishTask(t.id, key.id, false);
+          }
+        } catch (err) {
+          if (isInsufficientCredits(err)) {
+            markKeyExhausted(key.id, describeApiError(err));
+          }
+          upsertTask({
+            id: t.id,
+            status: 'FAILED',
+            lastError: `Polling failed: ${describeApiError(err)}`,
+          });
+          finishTask(t.id, key.id, false);
+        }
+      })();
+    }
+  }
+  tickScheduler();
 }
 
 // ---------- IPC handlers ----------
 
 function registerIpc() {
-  // -- Store passthrough (kept narrow: only known keys) --
+  // ---- Store passthrough (now also exposes `outputFolder`) ----
   ipcMain.handle('store:get', (_e, key) => {
-    if (!['keys', 'tasks'].includes(key)) {
+    if (!['keys', 'tasks', 'outputFolder'].includes(key)) {
       throw new Error(`Unsupported store key: ${key}`);
     }
     return store.get(key);
   });
 
   ipcMain.handle('store:set', (_e, key, value) => {
-    if (!['keys', 'tasks'].includes(key)) {
+    if (!['keys', 'tasks', 'outputFolder'].includes(key)) {
       throw new Error(`Unsupported store key: ${key}`);
     }
     store.set(key, value);
@@ -444,7 +822,7 @@ function registerIpc() {
     return true;
   });
 
-  // -- File picker --
+  // ---- File picker / folder picker ----
   ipcMain.handle('dialog:select-file', async (_e, kind) => {
     const filters =
       kind === 'image'
@@ -460,19 +838,51 @@ function registerIpc() {
     if (result.canceled || result.filePaths.length === 0) return null;
     const filePath = result.filePaths[0];
     const stat = fs.statSync(filePath);
-    return {
-      path: filePath,
-      name: path.basename(filePath),
-      size: stat.size,
-    };
+    return { path: filePath, name: path.basename(filePath), size: stat.size };
   });
 
-  // -- Upload a local file to a temporary public host (uguu.se) --
-  ipcMain.handle('upload-file', async (_e, filePath) => {
-    return uploadFromPath(filePath);
+  ipcMain.handle('dialog:select-folder', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose output folder',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
   });
 
-  // -- Upload an in-memory buffer (e.g. a cropped image from the renderer) --
+  ipcMain.handle('output-folder:get', () => store.get('outputFolder'));
+  ipcMain.handle('output-folder:set', (_e, folder) => {
+    if (folder && !fs.existsSync(folder)) {
+      try {
+        fs.mkdirSync(folder, { recursive: true });
+      } catch (err) {
+        throw new Error(`Cannot create folder: ${err.message}`);
+      }
+    }
+    store.set('outputFolder', folder || null);
+    notifyAllRenderers('outputFolder:changed', folder || null);
+    return folder || null;
+  });
+
+  // ---- Buffer persistence (for cropped images that need to enter the
+  //      queue with a stable file path) ----
+  ipcMain.handle('persist-buffer', async (_e, payload) => {
+    const { filename, dataBase64 } = payload || {};
+    if (typeof dataBase64 !== 'string' || !dataBase64) {
+      throw new Error('persist-buffer: dataBase64 is required');
+    }
+    const buf = Buffer.from(dataBase64, 'base64');
+    if (!buf.length) throw new Error('persist-buffer: empty buffer');
+    const dir = path.join(app.getPath('userData'), 'queued-images');
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = (filename || `image-${Date.now()}.jpg`).replace(/[^\w.\-]+/g, '_');
+    const target = path.join(dir, `${Date.now()}-${safe}`);
+    fs.writeFileSync(target, buf);
+    return target;
+  });
+
+  // ---- Legacy direct upload helpers (still used by tests / debug) ----
+  ipcMain.handle('upload-file', async (_e, filePath) => uploadFromPath(filePath));
   ipcMain.handle('upload-buffer', async (_e, payload) => {
     const { filename, dataBase64 } = payload || {};
     if (typeof dataBase64 !== 'string' || !dataBase64) {
@@ -483,7 +893,6 @@ function registerIpc() {
     return putToHost(buf, filename);
   });
 
-  // -- Read a local file and return base64 (for previewing in the renderer) --
   ipcMain.handle('read-file-base64', async (_e, filePath) => {
     if (!fs.existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
@@ -497,123 +906,56 @@ function registerIpc() {
     };
   });
 
-  // -- Submit Motion Control task --
-  ipcMain.handle('submit-task', async (_e, payload) => {
-    const {
-      quality = 'pro',
-      image_url,
-      video_url,
-      prompt,
-      character_orientation,
-      cfg_scale,
-    } = payload || {};
-
-    if (!image_url || !video_url) {
-      throw new Error('image_url and video_url are required');
+  // ---- Queue a new task (replaces direct submit-task) ----
+  ipcMain.handle('queue-task', async (_e, request) => {
+    if (!request?.imagePath || !request?.videoPath) {
+      throw new Error('queue-task: imagePath and videoPath are required');
     }
-
-    const url = quality === 'std' ? ENDPOINT_STD : ENDPOINT_PRO;
-    const body = { image_url, video_url };
-    if (prompt) body.prompt = String(prompt).slice(0, 2500);
-    if (character_orientation) body.character_orientation = character_orientation;
-    if (typeof cfg_scale === 'number') body.cfg_scale = cfg_scale;
-
-    const data = await callMagnific({ method: 'post', url, data: body });
-    const inner = data?.data || data || {};
-    const taskId = inner.task_id || inner.id;
-    if (!taskId) {
-      throw new Error('Magnific did not return a task_id');
+    if (!fs.existsSync(request.imagePath)) {
+      throw new Error(`Image file not found: ${request.imagePath}`);
     }
-
+    if (!fs.existsSync(request.videoPath)) {
+      throw new Error(`Video file not found: ${request.videoPath}`);
+    }
     const task = {
-      id: taskId,
-      status: inner.status || 'CREATED',
-      quality,
-      prompt: prompt || '',
-      imageUrl: image_url,
-      videoUrl: video_url,
-      orientation: character_orientation || 'video',
-      cfg_scale: typeof cfg_scale === 'number' ? cfg_scale : 0.5,
+      id: uuid(),
+      status: 'QUEUED',
+      quality: request.quality === 'std' ? 'std' : 'pro',
+      prompt: request.prompt || '',
+      orientation: request.orientation || 'video',
+      cfg_scale: typeof request.cfg_scale === 'number' ? request.cfg_scale : 0.5,
+      request: {
+        imagePath: request.imagePath,
+        videoPath: request.videoPath,
+        prompt: request.prompt || '',
+        quality: request.quality === 'std' ? 'std' : 'pro',
+        orientation: request.orientation || 'video',
+        cfg_scale: typeof request.cfg_scale === 'number' ? request.cfg_scale : 0.5,
+      },
+      imageUrl: null,
+      videoUrl: null,
       resultUrl: null,
+      magnificTaskId: null,
+      assignedKeyId: null,
+      localPath: null,
+      lastError: null,
       createdAt: new Date().toISOString(),
     };
     upsertTask(task);
-    startPolling(taskId);
+    tickScheduler();
     return task;
   });
 
-  // -- Manual poll (renderer can request a fresh status) --
-  ipcMain.handle('poll-task', async (_e, taskId) => {
-    const data = await callMagnific({
-      method: 'get',
-      url: ENDPOINT_POLL(taskId),
-    });
-    const inner = data?.data || data || {};
-    const status = inner.status || 'IN_PROGRESS';
-    const generated = Array.isArray(inner.generated) ? inner.generated : [];
-    const resultUrl = generated.find(Boolean) || null;
-    const failureReason = status === 'FAILED' ? extractFailureReason(inner) : null;
-    upsertTask({
-      id: taskId,
-      status,
-      ...(resultUrl ? { resultUrl } : {}),
-      ...(failureReason ? { lastError: failureReason } : {}),
-      lastPolledAt: new Date().toISOString(),
-    });
-    return { taskId, status, resultUrl, failureReason };
-  });
-
-  // -- Download result video to user-chosen folder --
-  // Accepts { taskId, defaultName } (preferred) and falls back to a raw
-  // { url } for callers that already have one in hand. The handler is
-  // resilient to short-lived signed URLs and to APIs that gate downloads
-  // on the same x-magnific-api-key header used elsewhere:
-  //
-  //   1. If a taskId is given, poll Magnific once to refresh `resultUrl`.
-  //   2. Try the URL with the active API key + a browser-style UA.
-  //   3. On 401/403 fall back to a plain GET (signed URLs sometimes
-  //      reject extra auth headers).
-  //   4. On 401/403 again, poll once more (URL may have been rotated)
-  //      and retry with the freshest URL.
+  // ---- Manual download to a user-chosen file path (kept for users who
+  //      didn't configure an output folder, or for re-downloads) ----
   ipcMain.handle('download-video', async (_e, payload) => {
     const { taskId, defaultName } = payload || {};
     let { url } = payload || {};
-
-    async function refreshUrl() {
-      if (!taskId) return url;
-      try {
-        const data = await callMagnific({
-          method: 'get',
-          url: ENDPOINT_POLL(taskId),
-        });
-        const inner = data?.data || data || {};
-        const generated = Array.isArray(inner.generated) ? inner.generated : [];
-        const fresh = generated.find(Boolean) || null;
-        if (fresh) {
-          url = fresh;
-          upsertTask({
-            id: taskId,
-            status: inner.status || 'COMPLETED',
-            resultUrl: fresh,
-            lastPolledAt: new Date().toISOString(),
-          });
-        }
-      } catch (_err) {
-        // Best-effort refresh: keep the URL we already have.
-      }
-      return url;
-    }
-
     if (taskId) {
-      // Use the freshest URL we have on disk first; refresh if missing.
       const t = getTasks().find((x) => x.id === taskId);
       if (t?.resultUrl) url = t.resultUrl;
-      if (!url) await refreshUrl();
     }
-
-    if (!url) {
-      throw new Error('No result URL available for this task yet.');
-    }
+    if (!url) throw new Error('No result URL available for this task yet.');
 
     const safeName = defaultName || `magnific-${Date.now()}.mp4`;
     const result = await dialog.showSaveDialog(mainWindow, {
@@ -623,21 +965,12 @@ function registerIpc() {
     });
     if (result.canceled || !result.filePath) return null;
 
-    const BROWSER_UA =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    const keys = getKeys();
+    const ordered = keys.filter((k) => !k.exhausted);
+    const baseHeaders = { 'User-Agent': UPLOAD_UA, Accept: 'video/mp4,*/*' };
 
-    function activeApiKey() {
-      const keys = getKeys();
-      const idx = getActiveKeyIndex(keys);
-      return idx >= 0 ? keys[idx].value : null;
-    }
-
-    async function attemptDownload(targetUrl, withApiKey) {
-      const headers = { 'User-Agent': BROWSER_UA, Accept: 'video/mp4,*/*' };
-      const key = withApiKey ? activeApiKey() : null;
-      if (key) headers['x-magnific-api-key'] = key;
-      const resp = await axios.get(targetUrl, {
+    async function attempt(headers) {
+      const resp = await axios.get(url, {
         headers,
         responseType: 'stream',
         timeout: 5 * 60_000,
@@ -648,48 +981,66 @@ function registerIpc() {
       return result.filePath;
     }
 
-    function isAuthError(err) {
-      const s = err?.response?.status;
-      return s === 401 || s === 403;
-    }
-
-    try {
-      return await attemptDownload(url, true);
-    } catch (err1) {
-      if (!isAuthError(err1)) throw err1;
+    let lastErr = null;
+    for (const k of ordered) {
       try {
-        return await attemptDownload(url, false);
-      } catch (err2) {
-        if (!isAuthError(err2) || !taskId) throw err2;
-        // Last resort: refresh URL once more and retry both header modes.
-        const refreshed = await refreshUrl();
-        if (!refreshed || refreshed === url) throw err2;
-        try {
-          return await attemptDownload(refreshed, true);
-        } catch (err3) {
-          if (!isAuthError(err3)) throw err3;
-          return await attemptDownload(refreshed, false);
-        }
+        return await attempt({ ...baseHeaders, 'x-magnific-api-key': k.value });
+      } catch (err) {
+        lastErr = err;
+        const s = err?.response?.status;
+        if (s !== 401 && s !== 403) break;
       }
+    }
+    try {
+      return await attempt(baseHeaders);
+    } catch (err) {
+      throw lastErr || err;
     }
   });
 
-  // -- Task management --
+  // ---- Task management ----
   ipcMain.handle('task:delete', (_e, taskId) => {
-    stopPolling(taskId);
+    const t = getTasks().find((x) => x.id === taskId);
+    if (t?.magnificTaskId && pollers.has(t.magnificTaskId)) {
+      clearTimeout(pollers.get(t.magnificTaskId));
+      pollers.delete(t.magnificTaskId);
+    }
     return deleteTaskById(taskId);
   });
 
   ipcMain.handle('task:resume-polling', (_e, taskId) => {
-    startPolling(taskId);
+    // Re-queue if it ended up stuck.
+    const t = getTasks().find((x) => x.id === taskId);
+    if (!t) return false;
+    if (t.status === 'FAILED' || t.status === 'COMPLETED' || t.status === 'DONE') {
+      upsertTask({ id: taskId, status: 'QUEUED', assignedKeyId: null, lastError: null });
+      tickScheduler();
+    }
     return true;
   });
 
-  // -- Convenience: which key is active? --
+  // ---- Key management ----
   ipcMain.handle('keys:active', () => {
     const keys = getKeys();
-    const idx = getActiveKeyIndex(keys);
-    return idx >= 0 ? keys[idx] : null;
+    return keys.find((k) => k.isActive && !k.exhausted) ||
+      keys.find((k) => k.isActive) ||
+      keys.find((k) => !k.exhausted) ||
+      null;
+  });
+
+  ipcMain.handle('keys:reset-exhausted', (_e, keyId) => {
+    const updated = patchKey(keyId, {
+      exhausted: false,
+      exhaustedAt: null,
+      exhaustedReason: null,
+    });
+    tickScheduler();
+    return updated;
+  });
+
+  ipcMain.handle('keys:mark-exhausted', (_e, keyId) => {
+    markKeyExhausted(keyId, 'Manually marked Habis');
+    return true;
   });
 }
 
@@ -698,8 +1049,7 @@ function registerIpc() {
 app.whenReady().then(() => {
   registerIpc();
   createWindow();
-  resumeInProgressPolling();
-
+  resumeOnRestart();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -710,5 +1060,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  for (const id of pollers.keys()) stopPolling(id);
+  for (const t of pollers.values()) clearTimeout(t);
+  pollers.clear();
 });

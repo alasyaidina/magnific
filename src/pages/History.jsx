@@ -69,15 +69,24 @@ export default function History({ tasks }) {
             {tasks.map((t) => {
               const created = new Date(t.createdAt);
               const updated = t.lastPolledAt ? new Date(t.lastPolledAt) : null;
-              const duration =
-                t.status === 'COMPLETED' || t.status === 'FAILED'
-                  ? humanDuration(
-                      (updated ? updated.getTime() : Date.now()) -
-                        created.getTime(),
-                    )
-                  : t.status === 'IN_PROGRESS' || t.status === 'CREATED'
-                    ? `${humanDuration(Date.now() - created.getTime())} (running)`
-                    : '—';
+              const isTerminal =
+                t.status === 'COMPLETED' ||
+                t.status === 'FAILED' ||
+                t.status === 'DONE';
+              const isInFlight =
+                t.status === 'PREPARING' ||
+                t.status === 'SUBMITTING' ||
+                t.status === 'IN_PROGRESS' ||
+                t.status === 'CREATED' ||
+                t.status === 'DOWNLOADING';
+              const duration = isTerminal
+                ? humanDuration(
+                    (updated ? updated.getTime() : Date.now()) -
+                      created.getTime(),
+                  )
+                : isInFlight
+                  ? `${humanDuration(Date.now() - created.getTime())} (running)`
+                  : '—';
               return (
                 <tr key={t.id} className="border-t border-white/5 align-top">
                   <td className="px-5 py-3 text-gray-300 whitespace-nowrap">
@@ -100,24 +109,41 @@ export default function History({ tasks }) {
                         {t.lastError}
                       </div>
                     )}
+                    {t.localPath && (
+                      <div
+                        className="text-xs text-emerald-300 mt-1 truncate"
+                        title={t.localPath}
+                      >
+                        Saved: {t.localPath}
+                      </div>
+                    )}
+                    {t.localDownloadError && (
+                      <div
+                        className="text-xs text-amber-300 mt-1 truncate"
+                        title={t.localDownloadError}
+                      >
+                        Auto-download failed: {t.localDownloadError}
+                      </div>
+                    )}
                   </td>
                   <td className="px-5 py-3 text-right space-x-2 whitespace-nowrap">
-                    {t.status === 'COMPLETED' && t.resultUrl && (
+                    {(t.status === 'COMPLETED' || t.status === 'DONE') && t.resultUrl && (
                       <button
                         className="btn-primary"
                         onClick={() => handleDownload(t)}
                         disabled={busyId === t.id}
                       >
-                        Download
+                        {t.localPath ? 'Save again' : 'Download'}
                       </button>
                     )}
-                    {(t.status === 'IN_PROGRESS' || t.status === 'CREATED') && (
+                    {(t.status === 'FAILED') && (
                       <button
                         className="btn-secondary"
                         onClick={() => handleResume(t)}
                         disabled={busyId === t.id}
+                        title="Re-queue this task to try again on a different key."
                       >
-                        Resume polling
+                        Retry
                       </button>
                     )}
                     <button
