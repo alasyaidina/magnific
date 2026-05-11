@@ -15,87 +15,43 @@ const RATIOS = [
   { value: 'free', label: 'Free' },
 ];
 
-const PHASES = {
-  IDLE: 'IDLE',
-  UPLOADING_IMAGE: 'UPLOADING_IMAGE',
-  UPLOADING_VIDEO: 'UPLOADING_VIDEO',
-  SUBMITTING: 'SUBMITTING',
-  POLLING: 'POLLING',
-  DONE: 'DONE',
-  ERROR: 'ERROR',
-};
+const ACTIVE_STATUSES = new Set([
+  'QUEUED',
+  'PREPARING',
+  'SUBMITTING',
+  'CREATED',
+  'IN_PROGRESS',
+  'DOWNLOADING',
+]);
 
-const PHASE_LABEL = {
-  IDLE: 'Idle',
-  UPLOADING_IMAGE: 'Uploading image…',
-  UPLOADING_VIDEO: 'Uploading video…',
-  SUBMITTING: 'Submitting task…',
-  POLLING: 'Polling status…',
-  DONE: 'Completed',
-  ERROR: 'Error',
-};
-
-export default function Generator({ keys, activeKey, onGoToSettings, onGoToHistory }) {
+export default function Generator({
+  keys,
+  activeKey,
+  tasks,
+  outputFolder,
+  onGoToSettings,
+  onGoToHistory,
+  onGoToApi,
+}) {
   const [imageFile, setImageFile] = useState(null);
   const [imageBlobUrl, setImageBlobUrl] = useState(null);
   const [imageLoadError, setImageLoadError] = useState(null);
   const [videoFile, setVideoFile] = useState(null);
   const [prompt, setPrompt] = useState('');
-  const [quality, setQuality] = useState('pro'); // 'pro' | 'std'
-  const [orientation, setOrientation] = useState('video'); // 'video' | 'image'
+  const [quality, setQuality] = useState('pro');
+  const [orientation, setOrientation] = useState('video');
   const [cfgScale, setCfgScale] = useState(0.5);
 
-  // Aspect ratio cropper state.
-  const [ratio, setRatio] = useState('free'); // '1:1' | '9:16' | '16:9' | '4:3' | 'free'
-  const [cropResult, setCropResult] = useState(null); // { ratio, dataBase64, mime, blobUrl, name }
-  const [cropperRatio, setCropperRatio] = useState(null); // active modal aspect, null when closed
+  const [ratio, setRatio] = useState('free');
+  const [cropResult, setCropResult] = useState(null);
+  const [cropperRatio, setCropperRatio] = useState(null);
 
-  const [phase, setPhase] = useState(PHASES.IDLE);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
-  const [activeTaskId, setActiveTaskId] = useState(null);
-  const [activeTask, setActiveTask] = useState(null);
 
-  const [pollSecondsLeft, setPollSecondsLeft] = useState(0);
+  const queueable = !!imageFile && !!videoFile && keys.length > 0 && !submitting;
 
-  const canSubmit =
-    keys.length > 0 &&
-    !!imageFile &&
-    !!videoFile &&
-    phase !== PHASES.UPLOADING_IMAGE &&
-    phase !== PHASES.UPLOADING_VIDEO &&
-    phase !== PHASES.SUBMITTING;
-
-  // Subscribe to task changes so we can render live status from the store.
-  useEffect(() => {
-    if (!activeTaskId) return undefined;
-    const off = window.api.onTasksChanged((tasks) => {
-      const t = (tasks || []).find((x) => x.id === activeTaskId);
-      if (t) {
-        setActiveTask(t);
-        if (t.status === 'COMPLETED') setPhase(PHASES.DONE);
-        else if (t.status === 'FAILED') {
-          setPhase(PHASES.ERROR);
-          setError(t.lastError || 'Task failed');
-        }
-      }
-    });
-    return () => off && off();
-  }, [activeTaskId]);
-
-  // Show countdown to next poll while in progress.
-  useEffect(() => {
-    if (phase !== PHASES.POLLING) {
-      setPollSecondsLeft(0);
-      return undefined;
-    }
-    setPollSecondsLeft(5);
-    const interval = setInterval(() => {
-      setPollSecondsLeft((s) => (s <= 1 ? 5 : s - 1));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [phase, activeTask?.lastPolledAt]);
-
-  // Load the picked image into a blob URL so the cropper can preview it.
+  // Load picked image into a blob URL for cropper preview.
   useEffect(() => {
     if (!imageFile?.path) {
       setImageBlobUrl(null);
@@ -122,7 +78,6 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     };
   }, [imageFile?.path]);
 
-  // Revoke the cropped blob URL when it's replaced.
   useEffect(() => {
     return () => {
       if (cropResult?.blobUrl) URL.revokeObjectURL(cropResult.blobUrl);
@@ -133,7 +88,6 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     const f = await window.api.selectFile('image');
     if (f) {
       setImageFile(f);
-      // Reset crop state — the previous crop no longer applies.
       setRatio('free');
       setCropResult(null);
       setCropperRatio(null);
@@ -177,76 +131,78 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
     setCropperRatio(null);
   };
 
+  const handlePickFolder = async () => {
+    const folder = await window.api.selectFolder();
+    if (folder) {
+      try {
+        await window.api.setOutputFolder(folder);
+      } catch (err) {
+        setError(err?.message || 'Could not set output folder');
+      }
+    }
+  };
+
+  const handleClearFolder = async () => {
+    try {
+      await window.api.setOutputFolder(null);
+    } catch (err) {
+      setError(err?.message || 'Could not clear output folder');
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!canSubmit) return;
+    if (!queueable) return;
     setError(null);
-
+    setSubmitting(true);
     try {
-      setPhase(PHASES.UPLOADING_IMAGE);
-      // If the user produced a cropped image, upload that buffer instead of
-      // the original file. Otherwise (Free / no crop yet) upload the file as-is.
-      const imageUrl = cropResult
-        ? await window.api.uploadBuffer({
-            filename: cropResult.name,
-            dataBase64: cropResult.dataBase64,
-          })
-        : await window.api.uploadFile(imageFile.path);
-
-      setPhase(PHASES.UPLOADING_VIDEO);
-      const videoUrl = await window.api.uploadFile(videoFile.path);
-
-      setPhase(PHASES.SUBMITTING);
-      const task = await window.api.submitTask({
+      // If the user cropped, persist that buffer to a real file so it
+      // survives until a worker picks it up (the renderer's blob/URL
+      // lives only as long as this page).
+      let imagePath = imageFile.path;
+      if (cropResult) {
+        imagePath = await window.api.persistBuffer({
+          filename: cropResult.name,
+          dataBase64: cropResult.dataBase64,
+        });
+      }
+      await window.api.queueTask({
+        imagePath,
+        videoPath: videoFile.path,
+        prompt: prompt || '',
         quality,
-        image_url: imageUrl,
-        video_url: videoUrl,
-        prompt: prompt || undefined,
-        character_orientation: orientation,
+        orientation,
         cfg_scale: Number(cfgScale),
       });
-      setActiveTaskId(task.id);
-      setActiveTask(task);
-      setPhase(PHASES.POLLING);
+      // Reset only the inputs that should change per submission. Keep
+      // the chosen video + options so the user can quickly queue many
+      // jobs against the same source.
+      setImageFile(null);
+      setRatio('free');
+      setCropResult(null);
+      setCropperRatio(null);
     } catch (err) {
-      setPhase(PHASES.ERROR);
       setError(err?.message || String(err));
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const handleReset = () => {
-    setImageFile(null);
-    setVideoFile(null);
-    setPrompt('');
-    setActiveTaskId(null);
-    setActiveTask(null);
-    setPhase(PHASES.IDLE);
-    setError(null);
-    setRatio('free');
-    setCropResult(null);
-    setCropperRatio(null);
-  };
+  const recent = useMemo(() => {
+    return tasks
+      .slice()
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 8);
+  }, [tasks]);
 
-  const handleDownload = async () => {
-    if (!activeTask?.resultUrl) return;
-    const safe = `magnific-${activeTask.id}.mp4`;
-    try {
-      await window.api.downloadVideo({
-        taskId: activeTask.id,
-        url: activeTask.resultUrl,
-        defaultName: safe,
-      });
-    } catch (err) {
-      setError(err?.message || 'Download failed');
-    }
-  };
-
-  const phaseStatus = useMemo(() => {
-    if (phase === PHASES.POLLING && activeTask?.status) return activeTask.status;
-    if (phase === PHASES.DONE) return 'COMPLETED';
-    if (phase === PHASES.ERROR) return 'FAILED';
-    return 'IDLE';
-  }, [phase, activeTask?.status]);
+  const activeCount = useMemo(
+    () => tasks.filter((t) => ACTIVE_STATUSES.has(t.status)).length,
+    [tasks],
+  );
+  const queuedCount = useMemo(
+    () => tasks.filter((t) => t.status === 'QUEUED').length,
+    [tasks],
+  );
 
   if (keys.length === 0) {
     return (
@@ -267,6 +223,12 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <form className="card lg:col-span-2 space-y-5" onSubmit={handleSubmit}>
+        <OutputFolderBar
+          folder={outputFolder}
+          onPick={handlePickFolder}
+          onClear={handleClearFolder}
+        />
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-3">
             <FilePicker
@@ -344,80 +306,81 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
         </div>
 
         <div className="flex items-center gap-3 pt-2">
-          <button type="submit" className="btn-primary" disabled={!canSubmit}>
-            Submit task
+          <button type="submit" className="btn-primary" disabled={!queueable}>
+            {submitting ? 'Queuing…' : 'Queue task'}
           </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={handleReset}
-            disabled={phase === PHASES.UPLOADING_IMAGE || phase === PHASES.UPLOADING_VIDEO || phase === PHASES.SUBMITTING}
-          >
-            Reset
-          </button>
-          {activeKey && (
-            <span className="text-xs text-gray-500 ml-auto">
-              Using key:{' '}
-              <span className="text-gray-300">{activeKey.label}</span>
-            </span>
-          )}
-        </div>
-      </form>
-
-      <aside className="card space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-gray-200">Status</h3>
-          <StatusBadge status={phaseStatus} />
-        </div>
-        <div className="text-sm text-gray-300">
-          {PHASE_LABEL[phase]}
-          {phase === PHASES.POLLING && pollSecondsLeft > 0 && (
-            <span className="text-gray-500"> (next poll in {pollSecondsLeft}s)</span>
-          )}
-        </div>
-
-        {(phase === PHASES.UPLOADING_IMAGE ||
-          phase === PHASES.UPLOADING_VIDEO ||
-          phase === PHASES.SUBMITTING) && (
-          <div className="h-1.5 bg-white/10 rounded overflow-hidden">
-            <div className="h-full bg-accent animate-pulse w-2/3" />
+          <div className="text-xs text-gray-500 ml-auto">
+            {keys.filter((k) => !k.exhausted).length} key(s) available
+            {' · '}
+            <button
+              type="button"
+              className="text-accent hover:underline"
+              onClick={onGoToApi}
+            >
+              API Management
+            </button>
           </div>
-        )}
-
-        {activeTask && (
-          <div className="text-xs text-gray-400 space-y-1 pt-2 border-t border-white/5">
-            <div>Task ID: <span className="text-gray-200 font-mono">{activeTask.id}</span></div>
-            <div>Quality: {activeTask.quality}</div>
-            <div>Created: {new Date(activeTask.createdAt).toLocaleString()}</div>
-            {activeTask.lastPolledAt && (
-              <div>Last polled: {new Date(activeTask.lastPolledAt).toLocaleTimeString()}</div>
-            )}
-          </div>
-        )}
-
-        {phase === PHASES.DONE && activeTask?.resultUrl && (
-          <div className="space-y-3 pt-2 border-t border-white/5">
-            <video
-              src={activeTask.resultUrl}
-              controls
-              className="w-full rounded border border-white/10 bg-black"
-            />
-            <div className="flex gap-2">
-              <button className="btn-primary" onClick={handleDownload}>
-                Download
-              </button>
-              <button className="btn-secondary" onClick={onGoToHistory}>
-                Open History
-              </button>
-            </div>
-          </div>
-        )}
-
+        </div>
         {error && (
           <div className="text-sm text-red-300 bg-red-900/30 border border-red-500/30 rounded-md px-3 py-2">
             {error}
           </div>
         )}
+      </form>
+
+      <aside className="card space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-gray-200">Queue</h3>
+          <div className="text-xs text-gray-400">
+            <span className="text-emerald-300">{activeCount - queuedCount}</span>
+            {' running · '}
+            <span className="text-slate-300">{queuedCount}</span>
+            {' queued'}
+          </div>
+        </div>
+
+        {recent.length === 0 && (
+          <p className="text-xs text-gray-500">
+            Queued and recent tasks will show up here.
+          </p>
+        )}
+
+        <ul className="space-y-2">
+          {recent.map((t) => (
+            <li
+              key={t.id}
+              className="border border-white/5 rounded-md bg-black/30 px-3 py-2 text-xs"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <StatusBadge status={t.status} />
+                <span className="text-gray-500">
+                  {new Date(t.createdAt).toLocaleTimeString()}
+                </span>
+              </div>
+              <div className="mt-1 text-gray-300 truncate" title={t.prompt || ''}>
+                {t.prompt || <span className="text-gray-500">(no prompt)</span>}
+              </div>
+              {t.localPath && (
+                <div className="mt-1 text-emerald-300 truncate" title={t.localPath}>
+                  Saved: {t.localPath}
+                </div>
+              )}
+              {t.lastError && (
+                <div className="mt-1 text-red-300 line-clamp-2" title={t.lastError}>
+                  {t.lastError}
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+
+        <button
+          type="button"
+          className="btn-secondary w-full"
+          onClick={onGoToHistory}
+        >
+          Open History
+        </button>
       </aside>
 
       {cropperRatio && imageBlobUrl && (
@@ -427,6 +390,32 @@ export default function Generator({ keys, activeKey, onGoToSettings, onGoToHisto
           onConfirm={handleCropConfirm}
           onCancel={() => setCropperRatio(null)}
         />
+      )}
+    </div>
+  );
+}
+
+function OutputFolderBar({ folder, onPick, onClear }) {
+  return (
+    <div className="rounded-md border border-white/10 bg-black/30 px-3 py-2 flex items-center gap-3 text-xs">
+      <span className="text-gray-400">Auto-download folder</span>
+      <span
+        className={`flex-1 truncate ${folder ? 'text-gray-100' : 'text-gray-500'}`}
+        title={folder || ''}
+      >
+        {folder || 'Not set — videos won\u2019t auto-download'}
+      </span>
+      <button type="button" className="btn-secondary !py-1 !px-2" onClick={onPick}>
+        {folder ? 'Change' : 'Choose folder'}
+      </button>
+      {folder && (
+        <button
+          type="button"
+          className="text-gray-400 hover:text-red-300"
+          onClick={onClear}
+        >
+          Clear
+        </button>
       )}
     </div>
   );
